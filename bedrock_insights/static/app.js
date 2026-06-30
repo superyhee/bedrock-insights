@@ -460,6 +460,9 @@ function renderChart(trend) {
   const dpr = window.devicePixelRatio || 1;
   const cssW = canvas.clientWidth || canvas.parentElement.clientWidth - 32;
   const cssH = 160;
+  // Canvas is hidden (e.g. the Recent tab is active) → skip drawing; LAST_TREND
+  // is retained so setTab can redraw it correctly once Overview is visible.
+  if (cssW <= 0) return;
   canvas.width = cssW * dpr;
   canvas.height = cssH * dpr;
   const ctx = canvas.getContext("2d");
@@ -988,6 +991,8 @@ function setTab(name) {
   positionTabUnderline();
   writeStateToUrl();
   if (name === "recent") refreshRecent();
+  // The chart can't size itself while hidden; redraw now that Overview is shown.
+  else if (LAST_TREND) renderChart(LAST_TREND);
 }
 
 async function refreshRecent() {
