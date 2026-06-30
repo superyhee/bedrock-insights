@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from bedrock_insights import notify
+from bedrock_insights.notify import ThresholdAlerter
+
+
+def test_alerter_fires_once_when_crossed(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notify, "send_webhook", lambda url, payload, timeout=10: sent.append((url, payload)) or (True, "200"))
+
+    a = ThresholdAlerter(2.0, "https://hooks.example/x", region="us-east-1", label="Today")
+    assert a.check(1.0) is False        # below threshold
+    assert a.check(2.5) is True         # crosses → fires
+    assert a.check(3.0) is False        # already fired → quiet
+    assert len(sent) == 1
+    url, payload = sent[0]
+    assert url == "https://hooks.example/x"
+    assert payload["event"] == "threshold_exceeded"
+    assert payload["cost"] == 2.5
+    assert payload["threshold"] == 2.0
+    assert "text" in payload and "$2.50" in payload["text"]
+
+
+def test_alerter_no_threshold_never_fires(monkeypatch):
+    monkeypatch.setattr(notify, "send_webhook", lambda *a, **k: (True, "200"))
+    a = ThresholdAlerter(None, "https://hooks.example/x")
+    assert a.check(9999.0) is False
+
+
+def test_alerter_without_webhook_still_fires_locally(monkeypatch):
+    calls = []
+    monkeypatch.setattr(notify, "send_webhook", lambda *a, **k: calls.append(1) or (True, "200"))
+    a = ThresholdAlerter(1.0, None)     # no webhook URL
+    assert a.check(5.0) is True
+    assert calls == []                  # no webhook attempted
+
+
+def test_alerter_webhook_failure_does_not_raise(monkeypatch):
+    monkeypatch.setattr(notify, "send_webhook", lambda *a, **k: (False, "Connection refused"))
+    a = ThresholdAlerter(1.0, "https://hooks.example/x")
+    # Should fire (return True) and swallow the delivery error without raising.
+    assert a.check(2.0) is True
+
+
+def test_send_webhook_posts_json(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=10):
+        captured["url"] = req.full_url
+        captured["data"] = req.data
+        captured["method"] = req.get_method()
+        captured["ctype"] = req.headers.get("Content-type")
+        return _Resp()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+    ok, info = notify.send_webhook("https://hooks.example/y", {"text": "hi"})
+    assert ok is True and info == "200"
+    assert captured["method"] == "POST"
+    assert captured["ctype"] == "application/json"
+    assert b'"text"' in captured["data"]
+
+
+def test_send_webhook_handles_exception(monkeypatch):
+    def boom(req, timeout=10):
+        raise OSError("network down")
+    monkeypatch.setattr(notify.urllib.request, "urlopen", boom)
+    ok, info = notify.send_webhook("https://hooks.example/y", {"text": "hi"})
+    assert ok is False
+    assert "network down" in info
+
+
+def test_alerter_configure_rearms(monkeypatch):
+    fires = []
+    monkeypatch.setattr(notify, "send_webhook", lambda *a, **k: fires.append(1) or (True, "200"))
+    a = ThresholdAlerter(2.0, "https://hooks.example/x")
+    assert a.check(3.0) is True          # fires
+    assert a.check(3.0) is False         # stays quiet
+    a.configure(2.0, "https://hooks.example/x")  # no change → still armed-spent
+    assert a.check(3.0) is False
+    a.configure(5.0, "https://hooks.example/x")  # threshold changed → re-armed
+    assert a.check(6.0) is True
+    assert len(fires) == 2
+
+
+def test_alerter_settings_roundtrip():
+    a = ThresholdAlerter(None, None)
+    assert a.settings() == {"threshold": None, "webhook_url": None}
+    a.configure(3.5, "https://hooks.example/x")
+    assert a.settings() == {"threshold": 3.5, "webhook_url": "https://hooks.example/x"}
+
+
+def test_alerter_send_test_uses_given_url(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notify, "send_webhook", lambda url, payload, timeout=10: sent.append((url, payload)) or (True, "200"))
+    a = ThresholdAlerter(None, None)
+    ok, info = a.send_test("https://hooks.example/test")
+    assert ok is True
+    assert sent[0][0] == "https://hooks.example/test"
+    assert sent[0][1]["event"] == "test"
+
+
+def test_alerter_send_test_no_url():
+    a = ThresholdAlerter(None, None)
+    ok, info = a.send_test(None)
+    assert ok is False
