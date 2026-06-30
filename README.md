@@ -12,14 +12,21 @@ There's no `bedrock usage` dashboard. This is that dashboard.
 
 ## Install
 
+Install from source:
+
 ```bash
-pip install bedrock-insights
+git clone https://github.com/superyhee/bedrock-insights.git
+cd bedrock-insights
+pip install .
 ```
 
-Or with uv:
+This puts the `bedrock-insights` command on your PATH. To keep it isolated from
+other tools, install it with [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/) instead:
 
 ```bash
-uv tool install bedrock-insights
+pipx install .
+# or
+uv tool install .
 ```
 
 ## First-time setup
