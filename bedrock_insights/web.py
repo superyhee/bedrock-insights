@@ -32,6 +32,7 @@ import errno
 import hmac
 import io
 import json
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -50,8 +51,19 @@ from .storage import FactStore
 
 console = Console()
 
-# Match terminal --live refresh cadence and ingestion-delay overlap window.
-REFRESH_SECONDS  = 5
+
+def _env_int(name: str, default: int) -> int:
+    """Read a positive int from the environment, falling back to default."""
+    try:
+        v = int(os.environ.get(name, ""))
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Background poll cadence + UI refresh default (seconds). Override via the
+# BEDROCK_INSIGHTS_POLL_SECONDS env var (e.g. the CloudFormation deploy sets it).
+REFRESH_SECONDS  = _env_int("BEDROCK_INSIGHTS_POLL_SECONDS", 5)
 _LIVE_OVERLAP_MS = 90_000
 
 # Persistence: per-event facts survive restarts and outlive CloudWatch retention.

@@ -44,3 +44,6 @@ htmlcov/
 # Local dev / scratch files
 test.py
 test_prices.json
+
+# Local-only blog draft (not part of the published project)
+BLOG.md

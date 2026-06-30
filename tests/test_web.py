@@ -582,3 +582,25 @@ def test_monitor_hybrid_old_window_hits_sqlite(fixed_pricing, tmp_path):
     assert snap["totals"]["calls"] == 2
     assert snap["totals"]["input_tokens"] == 300
     store.close()
+
+
+# ── poll-interval env override ───────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("60", 60),
+        ("5", 5),
+        ("", 7),        # unset/empty → default
+        ("abc", 7),     # non-numeric → default
+        ("0", 7),       # non-positive → default
+        ("-10", 7),     # negative → default
+    ],
+)
+def test_env_int_poll_seconds(monkeypatch, value, expected):
+    monkeypatch.setenv("BEDROCK_INSIGHTS_POLL_SECONDS", value)
+    assert web._env_int("BEDROCK_INSIGHTS_POLL_SECONDS", 7) == expected
+
+
+def test_env_int_missing_uses_default(monkeypatch):
+    monkeypatch.delenv("BEDROCK_INSIGHTS_POLL_SECONDS", raising=False)
+    assert web._env_int("BEDROCK_INSIGHTS_POLL_SECONDS", 5) == 5

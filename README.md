@@ -122,7 +122,7 @@ Open `https://<dashboard-url>/?token=<your-token>` once — the page stores the 
 
 ### What it creates
 
-- A VPC with a public subnet, and an **EC2 instance** (Amazon Linux 2023) that `pip install`s `bedrock-insights` and runs it as a systemd service on port 8765.
+- A VPC with a public subnet, and an **EC2 instance** (Amazon Linux 2023) that installs `bedrock-insights` from this GitHub repo and runs it as a systemd service on port 8765.
 - A **CloudFront distribution** in front of it, giving you HTTPS (via the default `*.cloudfront.net` certificate) and acting as the single entry point.
 - A security group that admits **only the CloudFront managed prefix list** — the public internet can't reach the instance directly, even though it has a public IP. The dashboard token remains the user-facing gate. A small Lambda-backed custom resource resolves the region-specific prefix list ID at deploy time.
 - The **Bedrock invocation log group**, the role Bedrock assumes to write to it, and a Lambda-backed custom resource that enables model invocation logging in the stack's region (there's no native CloudFormation resource for it).
@@ -130,16 +130,17 @@ Open `https://<dashboard-url>/?token=<your-token>` once — the page stores the 
 
 ### Parameters
 
-| Parameter          | Default                | Purpose                                                        |
-| ------------------ | ---------------------- | -------------------------------------------------------------- |
-| `AccessToken`      | _(required, `NoEcho`)_ | Token required to view the dashboard                           |
-| `Regions`          | _(stack region)_       | Comma-separated regions to monitor, e.g. `us-east-1,us-west-2` |
-| `InstanceType`     | `t3.small`             | `t3.micro` / `t3.small` / `t3.medium`                          |
-| `LogRetentionDays` | `90`                   | CloudWatch retention for the Bedrock log group                 |
-| `PriceClass`       | `PriceClass_100`       | CloudFront edge-location coverage                              |
-| `VpcCidr`          | `10.20.0.0/16`         | CIDR for the VPC the stack creates                             |
+| Parameter          | Default                   | Purpose                                                            |
+| ------------------ | ------------------------- | ------------------------------------------------------------------ |
+| `AccessToken`      | _(required, `NoEcho`)_    | Token required to view the dashboard                               |
+| `Regions`          | _(major Bedrock regions)_ | Comma-separated regions to monitor, e.g. `us-east-1,us-west-2`     |
+| `InstanceType`     | `t3.small`                | `t3.micro` / `t3.small` / `t3.medium`                              |
+| `LogRetentionDays` | `90`                      | CloudWatch retention for the Bedrock log group                     |
+| `PollSeconds`      | `60`                      | Poll/refresh interval in seconds (how often CloudWatch is queried) |
+| `PriceClass`       | `PriceClass_100`          | CloudFront edge-location coverage                                  |
+| `VpcCidr`          | `10.20.0.0/16`            | CIDR for the VPC the stack creates                                 |
 
-> **Notes.** Logging is enabled only in the stack's region — deploy a stack per region to monitor others, or run `--setup` there. The token is embedded in EC2 user data and is recoverable via `ec2:DescribeInstanceAttribute`; rotate it if your trusted-operator set changes. Validate the template first with `aws cloudformation validate-template --template-body file://deploy/cloudformation.yaml`. Tear everything down with `aws cloudformation delete-stack --stack-name bedrock-insights` (the log group is retained on purpose so history isn't lost).
+> **Notes.** The instance installs from this GitHub repo, so the repository must be **public** (or the `git+https://…` URL in the template's user data needs credentials). Logging is enabled only in the stack's region — deploy a stack per region to monitor others, or run `--setup` there. The token is embedded in EC2 user data and is recoverable via `ec2:DescribeInstanceAttribute`; rotate it if your trusted-operator set changes. Validate the template first with `aws cloudformation validate-template --template-body file://deploy/cloudformation.yaml`. Tear everything down with `aws cloudformation delete-stack --stack-name bedrock-insights` (the log group is retained on purpose so history isn't lost).
 
 ## Persistence
 
@@ -180,4 +181,22 @@ For a model not yet in either source, the dashboard shows `N/A` for cost; you ca
 pip install -e ".[dev]"
 ruff check .
 pytest
+```
+
+### Project layout
+
+```
+bedrock_insights/
+  cli.py         # Click entry point — launch/bootstrap flags only
+  client.py      # boto3 session + per-region CloudWatch clients, region helpers
+  cloudwatch.py  # log-group reader: time windows, FilterLogEvents paging, model-id normalization
+  pricing.py     # per-region pricing (Bedrock CSV + Price List API), 24h disk cache, overrides
+  web.py         # stdlib HTTP server, background poller, aggregation/cache, dashboard HTML, auth, /metrics
+  storage.py     # SQLite FactStore (hybrid in-memory + on-disk persistence)
+  notify.py      # threshold alerts → Slack/webhook (stdlib urllib)
+  display.py     # shared label/formatting helpers
+  setup_cmd.py   # one-time --setup wizard (enables Bedrock invocation logging)
+deploy/
+  cloudformation.yaml   # one-click hosted deploy (EC2 behind CloudFront)
+tests/                  # pytest suite
 ```

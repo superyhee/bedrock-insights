@@ -13,7 +13,8 @@ Metadata:
       - Label: { default: "Access" }
         Parameters: [AccessToken, PriceClass]
       - Label: { default: "Instance" }
-        Parameters: [InstanceType, Regions, LogRetentionDays, LatestAmiId]
+        Parameters:
+          [InstanceType, Regions, PollSeconds, LogRetentionDays, LatestAmiId]
       - Label: { default: "Network" }
         Parameters: [VpcCidr]
 
@@ -34,8 +35,9 @@ Parameters:
     Default: ""
     Description: >
       Comma-separated regions to monitor (e.g. us-east-1,us-west-2). Leave blank
-      to use this stack's region. Logging is only enabled here — enable it in
-      other regions separately to see their data.
+      to monitor the major Bedrock regions by default. Note: logging is only
+      enabled in this stack's region — enable it in other regions separately
+      (run `bedrock-insights --setup` there) to see their data.
   LogRetentionDays:
     Type: Number
     Default: 90
@@ -60,6 +62,13 @@ Parameters:
         3653,
       ]
     Description: CloudWatch retention (days) for the Bedrock invocation log group.
+  PollSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 1
+    Description: >
+      Dashboard poll / refresh interval in seconds — how often the background
+      poller queries CloudWatch (also the UI's default auto-refresh cadence).
   PriceClass:
     Type: String
     Default: PriceClass_100
@@ -223,16 +232,11 @@ Resources:
       Tags: [{ Key: Name, Value: bedrock-insights }]
 
   # ─────────────────────────────────────────────────────────────────────────
-  # CloudWatch log group Bedrock writes invocations to + the role it assumes.
+  # Role Bedrock assumes to write invocation logs. The log group and the logging
+  # configuration are managed by the EnableLogging custom resource below, which
+  # is a no-op when invocation logging is already configured in this region — so
+  # an existing setup (and its log group) is never overwritten or deleted.
   # ─────────────────────────────────────────────────────────────────────────
-  BedrockLogGroup:
-    Type: AWS::Logs::LogGroup
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      LogGroupName: /aws/bedrock/model-invocations
-      RetentionInDays: !Ref LogRetentionDays
-
   BedrockLoggingRole:
     Type: AWS::IAM::Role
     Properties:
@@ -256,7 +260,7 @@ Resources:
                     logs:PutLogEvents,
                     logs:DescribeLogStreams,
                   ]
-                Resource: !Sub "${BedrockLogGroup.Arn}:*"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock/model-invocations:*"
 
   # ── Read-only role the dashboard instance runs under ───────────────────────
   DashboardRole:
@@ -323,6 +327,12 @@ Resources:
                   - bedrock:GetModelInvocationLoggingConfiguration
                   - bedrock:DeleteModelInvocationLoggingConfiguration
                 Resource: "*"
+              # Create the log group + set retention only when we enable logging.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:PutRetentionPolicy
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock/model-invocations:*"
               # Bedrock must be allowed to receive the logging role on enable.
               - Effect: Allow
                 Action: iam:PassRole
@@ -345,6 +355,8 @@ Resources:
 
           import boto3
 
+          LOG_GROUP_DEFAULT = "/aws/bedrock/model-invocations"
+
 
           def _respond(event, context, status, reason=""):
               body = json.dumps({
@@ -363,38 +375,71 @@ Resources:
               urllib.request.urlopen(req)  # noqa: S310 (CFN-signed S3 URL)
 
 
+          def _already_configured(bedrock):
+              """True if model invocation logging already writes to a CloudWatch group."""
+              try:
+                  cfg = bedrock.get_model_invocation_logging_configuration().get("loggingConfig") or {}
+                  return bool((cfg.get("cloudWatchConfig") or {}).get("logGroupName"))
+              except Exception as exc:
+                  print(f"get config failed (assuming not configured): {exc}")
+                  return False
+
+
           def handler(event, context):
+              # Teardown never disables logging or deletes the log group, so a
+              # pre-existing setup is preserved when the stack is removed.
+              if event["RequestType"] == "Delete":
+                  _respond(event, context, "SUCCESS")
+                  return
+
               status, reason = "SUCCESS", ""
               try:
                   bedrock = boto3.client("bedrock")
                   props = event.get("ResourceProperties", {})
-                  if event["RequestType"] == "Delete":
+                  log_group = props.get("LogGroupName") or LOG_GROUP_DEFAULT
+
+                  # If logging is already configured, leave everything untouched.
+                  if _already_configured(bedrock):
+                      print("model invocation logging already configured; no changes made")
+                      _respond(event, context, "SUCCESS", "already configured")
+                      return
+
+                  # Not configured yet — create the log group, set retention, enable.
+                  logs = boto3.client("logs")
+                  try:
+                      logs.create_log_group(logGroupName=log_group)
+                  except logs.exceptions.ResourceAlreadyExistsException:
+                      pass
+                  retention = props.get("RetentionDays")
+                  if retention:
                       try:
-                          bedrock.delete_model_invocation_logging_configuration()
-                      except Exception as exc:  # already gone / no perms — don't block teardown
-                          print(f"delete ignored: {exc}")
-                  else:
-                      cfg = {
-                          "cloudWatchConfig": {
-                              "logGroupName": props["LogGroupName"],
-                              "roleArn": props["RoleArn"],
-                          },
-                          "textDataDeliveryEnabled": True,
-                          "imageDataDeliveryEnabled": False,
-                          "embeddingDataDeliveryEnabled": False,
-                      }
-                      # Retry: the Bedrock logging role may still be propagating.
-                      last = None
-                      for _ in range(6):
-                          try:
-                              bedrock.put_model_invocation_logging_configuration(loggingConfig=cfg)
-                              last = None
-                              break
-                          except Exception as exc:
-                              last = exc
-                              time.sleep(5)
-                      if last is not None:
-                          raise last
+                          logs.put_retention_policy(
+                              logGroupName=log_group, retentionInDays=int(retention)
+                          )
+                      except Exception as exc:
+                          print(f"set retention failed (non-fatal): {exc}")
+
+                  cfg = {
+                      "cloudWatchConfig": {
+                          "logGroupName": log_group,
+                          "roleArn": props["RoleArn"],
+                      },
+                      "textDataDeliveryEnabled": True,
+                      "imageDataDeliveryEnabled": False,
+                      "embeddingDataDeliveryEnabled": False,
+                  }
+                  # Retry: the Bedrock logging role may still be propagating.
+                  last = None
+                  for _ in range(6):
+                      try:
+                          bedrock.put_model_invocation_logging_configuration(loggingConfig=cfg)
+                          last = None
+                          break
+                      except Exception as exc:
+                          last = exc
+                          time.sleep(5)
+                  if last is not None:
+                      raise last
               except Exception as exc:
                   status, reason = "FAILED", str(exc)
                   print(f"error: {exc}")
@@ -404,7 +449,8 @@ Resources:
     Type: AWS::CloudFormation::CustomResource
     Properties:
       ServiceToken: !GetAtt EnableLoggingFn.Arn
-      LogGroupName: !Ref BedrockLogGroup
+      LogGroupName: /aws/bedrock/model-invocations
+      RetentionDays: !Ref LogRetentionDays
       RoleArn: !GetAtt BedrockLoggingRole.Arn
 
   # ── EC2 instance running the dashboard as a systemd service ────────────────
@@ -425,10 +471,14 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -euo pipefail
-          dnf install -y python3 python3-pip
-          pip3 install --no-input bedrock-insights
+          dnf install -y python3 python3-pip git
+          # Install into an isolated venv so pip never fights the OS-managed
+          # awscrt rpm that ships on Amazon Linux 2023.
+          python3 -m venv /opt/bedrock-insights
+          /opt/bedrock-insights/bin/pip install --upgrade pip
+          /opt/bedrock-insights/bin/pip install --no-input "git+https://github.com/superyhee/bedrock-insights.git"
 
-          REGION_ARG="--region ${AWS::Region}"
+          REGION_ARG=""
           if [ -n "${Regions}" ]; then
             REGION_ARG="--region ${Regions}"
           fi
@@ -441,8 +491,11 @@ Resources:
 
           [Service]
           Environment=BEDROCK_INSIGHTS_TOKEN=${AccessToken}
-          Environment=AWS_DEFAULT_REGION=${AWS::Region}
-          ExecStart=/usr/local/bin/bedrock-insights --host 0.0.0.0 --port 8765 $REGION_ARG
+          # Use AWS_REGION (boto3) — not AWS_DEFAULT_REGION, which is the --region
+          # env binding — so a blank Regions falls back to the major-region default.
+          Environment=AWS_REGION=${AWS::Region}
+          Environment=BEDROCK_INSIGHTS_POLL_SECONDS=${PollSeconds}
+          ExecStart=/opt/bedrock-insights/bin/bedrock-insights --host 0.0.0.0 --port 8765 $REGION_ARG
           Restart=always
           RestartSec=5
           User=root
