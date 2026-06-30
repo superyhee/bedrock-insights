@@ -539,6 +539,12 @@ Outputs:
       Open this, then append ?token=YOUR_TOKEN the first time (the page stores
       it in a cookie and strips it from the URL afterwards).
     Value: !Sub "https://${DashboardDistribution.DomainName}"
+  DashboardURLWithToken:
+    Description: >
+      Ready-to-open URL with the access token embedded. NOTE: this exposes the
+      token in plaintext to anyone with cloudformation:DescribeStacks on this
+      stack — restrict access to the stack accordingly.
+    Value: !Sub "https://${DashboardDistribution.DomainName}/?token=${AccessToken}"
   DistributionId:
     Value: !Ref DashboardDistribution
   InstanceId:
