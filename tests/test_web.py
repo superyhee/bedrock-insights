@@ -604,3 +604,134 @@ def test_env_int_poll_seconds(monkeypatch, value, expected):
 def test_env_int_missing_uses_default(monkeypatch):
     monkeypatch.delenv("BEDROCK_INSIGHTS_POLL_SECONDS", raising=False)
     assert web._env_int("BEDROCK_INSIGHTS_POLL_SECONDS", 5) == 5
+
+
+# ── recent invocations ───────────────────────────────────────────────────────
+def test_recent_newest_first_and_limit(fixed_pricing, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.isoformat()  # noqa: E731
+    recs = [
+        _rec("e1", inp=100, ts=iso(now - timedelta(minutes=5))),
+        _rec("e2", inp=200, ts=iso(now - timedelta(minutes=1))),
+        _rec("e3", inp=300, ts=iso(now - timedelta(minutes=3))),
+    ]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    rows = m.recent(limit=2)
+    assert len(rows) == 2
+    # newest first: e2 (1m ago) then e3 (3m ago)
+    assert rows[0]["input_tokens"] == 200
+    assert rows[1]["input_tokens"] == 300
+    assert {"t", "model", "identity", "region", "input_tokens",
+            "output_tokens", "cost", "price_known", "error"}.issubset(rows[0])
+
+
+def test_recent_filter_by_region(fixed_pricing, monkeypatch):
+    recs = {
+        "E": [{"_eventId": "e1", "modelId": "m", "region": "us-east-1",
+               "input": {"inputTokenCount": 100}, "output": {"outputTokenCount": 0}}],
+        "W": [{"_eventId": "e2", "modelId": "m", "region": "us-west-2",
+               "input": {"inputTokenCount": 200}, "output": {"outputTokenCount": 0}}],
+    }
+    monkeypatch.setattr(web, "iter_log_events", lambda client, s, e: iter(recs[client]))
+    m = web.UsageMonitor(clients=[("us-east-1", "E"), ("us-west-2", "W")], period="today", since=None)
+    m.prime()
+    east = m.recent(limit=20, region="us-east-1")
+    assert len(east) == 1 and east[0]["region"] == "us-east-1"
+
+
+def test_recent_row_marks_error_and_unknown_price():
+    fact = {"t": 1, "model": "m", "display": "Model M", "ident_label": "alice",
+            "region": "us-east-1", "err": "ThrottlingException",
+            "inp": 10, "out": 0, "cw": 0, "cr": 5, "cost": 0.0, "known": False}
+    row = web._recent_row(fact)
+    assert row["error"] == "ThrottlingException"
+    assert row["price_known"] is False
+    assert row["model"] == "Model M"
+    assert row["total_tokens"] == 10
+
+
+# ── per-model sparkline ──────────────────────────────────────────────────────
+def test_model_sparkline_present_and_sums_to_cost(fixed_pricing, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.isoformat()  # noqa: E731
+    recs = [
+        _rec("e1", inp=1000, ts=iso(now - timedelta(hours=2))),
+        _rec("e2", inp=1000, ts=iso(now - timedelta(hours=1))),
+        _rec("e3", inp=1000, ts=iso(now - timedelta(minutes=5))),
+    ]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    model = m.snapshot(since="3h")["models"][0]
+    assert len(model["spark"]) == 20
+    assert abs(sum(model["spark"]) - model["cost"]) < 1e-6
+
+
+# ── cache savings estimate ───────────────────────────────────────────────────
+def test_cache_savings_in_totals(fixed_pricing, monkeypatch):
+    # 1M cache-read tokens priced at $0.30/1M vs $3.00/1M input → saves $2.70.
+    recs = [_rec("e1", inp=100, cr=1_000_000)]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    totals = m.snapshot(since="3h")["totals"]
+    assert abs(totals["cache_savings"] - 2.70) < 1e-6
+
+
+def test_cache_savings_zero_without_cache(fixed_pricing, monkeypatch):
+    m = _monitor(monkeypatch, [_rec("e1", inp=100, out=50)])
+    m.prime()
+    assert m.snapshot(since="3h")["totals"]["cache_savings"] == 0.0
+
+
+# ── absolute drill-in window ─────────────────────────────────────────────────
+def test_absolute_window_snapshot(fixed_pricing, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.isoformat()  # noqa: E731
+    recs = [
+        _rec("e1", inp=100, ts=iso(now - timedelta(minutes=10))),
+        _rec("e2", inp=100, ts=iso(now - timedelta(minutes=2))),
+    ]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    end = int(now.timestamp() * 1000)
+    start = int((now - timedelta(minutes=5)).timestamp() * 1000)
+    snap = m.snapshot(start=start, end=end)
+    assert snap["totals"]["calls"] == 1  # only e2 falls in the last 5 minutes
+    assert snap["window"]["period"] == "custom"
+
+
+# ── on-demand event detail (prompt / response bodies) ────────────────────────
+def test_fetch_event_returns_bodies(fixed_pricing, monkeypatch):
+    rec = {
+        "_eventId": "e1", "modelId": "anthropic.claude-x", "region": "us-east-1",
+        "input": {"inputTokenCount": 10,
+                  "inputBodyJson": {"messages": [{"role": "user", "content": "hi there"}]}},
+        "output": {"outputTokenCount": 5, "outputBodyJson": {"content": "hello back"}},
+    }
+    m = _monitor(monkeypatch, [rec])
+    m.prime()
+    d = m.fetch_event("us-east-1", "e1", web._now_ms())
+    assert "hi there" in d["input"] and "hello back" in d["output"]
+    assert d["error"] == "" and d["model_id"] == "anthropic.claude-x"
+
+
+def test_fetch_event_not_found(fixed_pricing, monkeypatch):
+    m = _monitor(monkeypatch, [])
+    m.prime()
+    d = m.fetch_event("us-east-1", "missing", web._now_ms())
+    assert "error" in d and d.get("input") is None
+
+
+def test_fetch_event_missing_id(fixed_pricing, monkeypatch):
+    m = _monitor(monkeypatch, [])
+    assert "error" in m.fetch_event("us-east-1", "", 0)
+
+
+def test_recent_row_includes_event_id():
+    fact = {"t": 1, "model": "m", "display": "M", "ident_label": "u", "region": "us-east-1",
+            "err": "", "inp": 1, "out": 1, "cw": 0, "cr": 0, "cost": 0.0, "known": True,
+            "key": "us-east-1:evt-123"}
+    assert web._recent_row(fact)["event_id"] == "evt-123"

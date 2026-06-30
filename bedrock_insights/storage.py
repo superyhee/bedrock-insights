@@ -50,6 +50,12 @@ class FactStore:
             """
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_t ON facts(t)")
+        # Backward-compatible migration: add the cache-savings column to DBs
+        # created before it existed.
+        try:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN saved REAL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._conn.commit()
 
     def add_many(self, rows) -> None:
@@ -59,6 +65,7 @@ class FactStore:
                 key, f["t"], f["model"], int(f["is_global"]), f["ident_key"],
                 f["ident_label"], f["region"], f["err"], f["inp"], f["out"],
                 f["cw"], f["cr"], f["cost"], int(f["known"]), f["display"],
+                f.get("saved", 0.0),
             )
             for key, f in rows
         ]
@@ -68,8 +75,8 @@ class FactStore:
             self._conn.executemany(
                 "INSERT OR IGNORE INTO facts "
                 "(key, t, model, is_global, ident_key, ident_label, region, err, "
-                " inp, out, cw, cr, cost, known, display) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " inp, out, cw, cr, cost, known, display, saved) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params,
             )
             self._conn.commit()
@@ -79,7 +86,7 @@ class FactStore:
         with self._lock:
             cur = self._conn.execute(
                 "SELECT key, t, model, is_global, ident_key, ident_label, region, "
-                "err, inp, out, cw, cr, cost, known, display "
+                "err, inp, out, cw, cr, cost, known, display, saved "
                 "FROM facts WHERE t >= ? ORDER BY t",
                 (min_t_ms,),
             )
@@ -93,6 +100,7 @@ class FactStore:
                 "ident_key": r[4], "ident_label": r[5], "region": r[6], "err": r[7],
                 "inp": r[8], "out": r[9], "cw": r[10], "cr": r[11],
                 "cost": r[12], "known": bool(r[13]), "display": r[14],
+                "saved": r[15] if r[15] is not None else 0.0,
             })
         return facts, keys
 

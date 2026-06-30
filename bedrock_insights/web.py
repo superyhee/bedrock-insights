@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import csv
 import errno
+import heapq
 import hmac
 import io
 import json
@@ -37,6 +38,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import resources
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -61,10 +63,31 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _load_static(name: str) -> str:
+    """Read a packaged static asset (HTML/CSS/JS) from bedrock_insights/static/."""
+    return (resources.files("bedrock_insights") / "static" / name).read_text(encoding="utf-8")
+
+
 # Background poll cadence + UI refresh default (seconds). Override via the
 # BEDROCK_INSIGHTS_POLL_SECONDS env var (e.g. the CloudFormation deploy sets it).
 REFRESH_SECONDS  = _env_int("BEDROCK_INSIGHTS_POLL_SECONDS", 5)
 _LIVE_OVERLAP_MS = 90_000
+
+# Max accepted request body (bytes) for POST endpoints — guards against a client
+# declaring a huge Content-Length and forcing a large allocation.
+_MAX_BODY_BYTES = 64 * 1024
+
+# Security headers applied to every response. The dashboard is a self-contained
+# page with inline CSS/JS, so the CSP permits 'unsafe-inline' for style/script
+# but otherwise locks the page down to same-origin.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy":        "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'"
+    ),
+}
 
 # Persistence: per-event facts survive restarts and outlive CloudWatch retention.
 _DB_RETENTION_DAYS = 90
@@ -94,10 +117,12 @@ def _record_ms(r: dict) -> int:
     return _now_ms()
 
 
-def _record_cost_tokens(r: dict, region: str | None = None) -> tuple[float, int, int, int, int, bool, str]:
-    """Return (cost, input, output, cache_write, cache_read, price_known, display_name).
+def _record_cost_tokens(r: dict, region: str | None = None) -> tuple[float, int, int, int, int, bool, str, float]:
+    """Return (cost, input, output, cache_write, cache_read, price_known, display_name, saved).
 
-    Priced with the given region's table when available (multi-region).
+    `saved` estimates how much the cache-read tokens saved versus paying the
+    full input rate for them. Priced with the given region's table when
+    available (multi-region).
     """
     raw_id    = r.get("modelId", "unknown")
     inp_data  = r.get("input") or {}
@@ -110,7 +135,8 @@ def _record_cost_tokens(r: dict, region: str | None = None) -> tuple[float, int,
         inp * p.input_per_1m + out * p.output_per_1m
         + cw * p.cache_write_per_1m + cr * p.cache_read_per_1m
     ) / 1_000_000
-    return cost, inp, out, cw, cr, (not p.needs_pricing), p.display_name
+    saved = cr * max(0.0, p.input_per_1m - p.cache_read_per_1m) / 1_000_000
+    return cost, inp, out, cw, cr, (not p.needs_pricing), p.display_name, saved
 
 
 def _identity_key(arn: str) -> tuple[str, str]:
@@ -129,6 +155,60 @@ def _identity_key(arn: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return resource, parts[-1]
     return resource, resource
+
+
+def _recent_row(f: dict) -> dict:
+    """Format a slim fact into a recent-invocations display row."""
+    key = f.get("key") or ""
+    event_id = key.split(":", 1)[1] if ":" in key else ""
+    return {
+        "t":                 f["t"],
+        "model":             f.get("display") or f["model"],
+        "model_id":          f["model"],
+        "identity":          f.get("ident_label") or "unknown",
+        "region":            f.get("region") or "",
+        "input_tokens":      f["inp"],
+        "output_tokens":     f["out"],
+        "cache_read_tokens":  f["cr"],
+        "cache_write_tokens": f["cw"],
+        "total_tokens":      f["inp"] + f["out"],
+        "cost":              round(f["cost"], 6),
+        "price_known":       f["known"],
+        "error":             f.get("err") or "",
+        "event_id":          event_id,
+    }
+
+
+def _event_detail(r: dict, limit: int = 6000) -> dict:
+    """Extract the (possibly truncated) request/response bodies from a log record.
+
+    Bodies live inline in the CloudWatch record when text delivery is enabled
+    and the payload is small; large payloads are offloaded to S3 (we surface the
+    path but never read it). Content is returned for on-demand display only and
+    is never stored by bedrock-insights.
+    """
+    inp = r.get("input") or {}
+    out = r.get("output") or {}
+
+    def grab(body):
+        if body is None:
+            return None, False
+        s = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, indent=2)
+        return (s[:limit], True) if len(s) > limit else (s, False)
+
+    in_text, in_trunc = grab(inp.get("inputBodyJson"))
+    out_text, out_trunc = grab(out.get("outputBodyJson"))
+    return {
+        "model_id":         r.get("modelId", ""),
+        "region":           r.get("region", ""),
+        "error":            r.get("errorCode") or "",
+        "input":            in_text,
+        "input_truncated":  in_trunc,
+        "input_s3":         inp.get("inputBodyS3Path"),
+        "output":           out_text,
+        "output_truncated": out_trunc,
+        "output_s3":        out.get("outputBodyS3Path"),
+    }
 
 
 def build_payload(usage: dict[str, dict]) -> dict:
@@ -185,6 +265,7 @@ def build_payload(usage: dict[str, dict]) -> dict:
             "cost":              round(cost, 6),
             "price_known":       known,
             "is_global":         stats.get("is_global", False),
+            "spark":             [round(x, 6) for x in stats.get("spark", [])],
         })
 
     # Sort by cost desc (unknown-price models, cost 0, fall to the bottom).
@@ -330,6 +411,13 @@ def _resolve_window(period: str, since: str | None) -> tuple[int, int, str]:
     return start_ms, end_ms, period_label(period)
 
 
+def _abs_window_label(start_ms: int, end_ms: int) -> str:
+    """Short label for an absolute drill-in window, e.g. '06-30 12:05–12:10'."""
+    s = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+    e = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc)
+    return f"{s:%m-%d %H:%M}–{e:%H:%M} UTC"
+
+
 def _bucket_seconds_for(span_ms: int) -> int:
     """Pick trend granularity from a window span: ≤3h→1min, ≤36h→5min, else 1h."""
     if span_ms <= 3 * 3_600_000:
@@ -337,6 +425,9 @@ def _bucket_seconds_for(span_ms: int) -> int:
     if span_ms <= 36 * 3_600_000:
         return 300
     return 3_600
+
+
+_SPARK_N = 20  # fixed-width per-model sparkline buckets (bounded payload size)
 
 
 def _aggregate_facts(
@@ -359,6 +450,7 @@ def _aggregate_facts(
     by_region:   dict[str, dict] = {}
     errors_by_code: dict[str, int] = {}
     error_total = 0
+    saved_total = 0.0
 
     for f in facts:
         if f["t"] < start_ms or f["t"] > end_ms:
@@ -374,6 +466,7 @@ def _aggregate_facts(
             "calls": 0, "input_tokens": 0, "output_tokens": 0,
             "cache_write_tokens": 0, "cache_read_tokens": 0, "is_global": False,
             "cost": 0.0, "price_known": True, "display_name": f["model"],
+            "spark": [0.0] * _SPARK_N,
         })
         u["calls"]              += 1
         u["input_tokens"]       += f["inp"]
@@ -384,6 +477,11 @@ def _aggregate_facts(
         u["cost"]               += f["cost"]
         u["price_known"]         = u["price_known"] and f["known"]
         u["display_name"]        = f["display"]
+
+        span = end_ms - start_ms
+        si = 0 if span <= 0 else min(_SPARK_N - 1, int((f["t"] - start_ms) / span * _SPARK_N))
+        u["spark"][si] += f["cost"]
+        saved_total += f.get("saved", 0.0)
 
         bt = (f["t"] // bucket_ms) * bucket_ms
         b = buckets.setdefault(bt, {"cost": 0.0, "input": 0, "output": 0, "calls": 0})
@@ -416,6 +514,7 @@ def _aggregate_facts(
             errors_by_code[f["err"]] = errors_by_code.get(f["err"], 0) + 1
 
     payload = build_payload(usage)
+    payload["totals"]["cache_savings"] = round(saved_total, 6)
     total_cost  = payload["totals"]["cost"]
     total_calls = payload["totals"]["calls"]
 
@@ -535,6 +634,9 @@ class UsageMonitor:
         self._cache: dict[tuple, dict] = {}
         self._cache_version = -1
         self._cache_lock = threading.Lock()
+        # Monotonic counter bumped whenever the fact list changes; used as the
+        # cache version so trimming + appends can't collide on an equal length.
+        self._facts_version = 0
 
     # ── window resolution ────────────────────────────────────────────────────
     def _window_for(self, period: str | None, since: str | None = None) -> tuple[str, int, int, str, int]:
@@ -617,7 +719,7 @@ class UsageMonitor:
                     self._seen_ids.add(key)
                 raw_id = r.get("modelId", "unknown")
                 rec_region = r.get("region") or client_region
-                cost, inp, out, cw, cr, known, display = _record_cost_tokens(r, rec_region)
+                cost, inp, out, cw, cr, known, display, saved = _record_cost_tokens(r, rec_region)
                 ident_key, ident_label = _identity_key((r.get("identity") or {}).get("arn", ""))
                 fact = {
                     "key":          key,
@@ -629,7 +731,7 @@ class UsageMonitor:
                     "region":       rec_region,
                     "err":          r.get("errorCode") or "",
                     "inp": inp, "out": out, "cw": cw, "cr": cr, "cost": cost,
-                    "known": known, "display": display,
+                    "known": known, "display": display, "saved": saved,
                 }
                 new_facts.append(fact)
                 if key:
@@ -639,12 +741,16 @@ class UsageMonitor:
         with self._lock:
             self._facts.extend(new_facts)
             # Trim memory to the window; older facts stay in SQLite (served via SQL).
+            trimmed = False
             if self._facts and self._facts[0]["t"] < floor:
                 self._facts = [f for f in self._facts if f["t"] >= floor]
                 self._seen_ids = {f["key"] for f in self._facts if f.get("key")}
+                trimmed = True
             self._memory_floor_ms = floor
             self._last_updated = datetime.now(timezone.utc)
             self._last_error = error
+            if new_facts or trimmed:
+                self._facts_version += 1
 
         # Persist outside the monitor lock (the store has its own lock).
         if self._store is not None and new_rows:
@@ -676,24 +782,31 @@ class UsageMonitor:
             self._thread.join(timeout=2)
 
     def snapshot(self, period: str | None = None, flt: dict | None = None,
-                 since: str | None = None) -> dict:
-        """Aggregate retained facts for the requested period/since and filter.
+                 since: str | None = None,
+                 start: int | None = None, end: int | None = None) -> dict:
+        """Aggregate retained facts for the requested window and filter.
 
-        Results are cached per (period, since, filter) and reused until the next
-        poll adds events, so repeated identical requests avoid re-aggregating.
+        An explicit absolute (start, end) window — used when drilling into a
+        chart bucket — overrides period/since. Results are cached per
+        (period, since, start, end, filter) and reused until the next poll.
         """
-        period, start_ms, end_ms, label, bucket_seconds = self._window_for(period, since)
+        if start is not None and end is not None:
+            start_ms, end_ms = int(start), int(end)
+            period, label = "custom", _abs_window_label(start_ms, end_ms)
+            bucket_seconds = _bucket_seconds_for(max(1, end_ms - start_ms))
+        else:
+            period, start_ms, end_ms, label, bucket_seconds = self._window_for(period, since)
         with self._lock:
-            n = len(self._facts)
-            view = self._facts[:n]  # cheap reference-copy slice
+            version = self._facts_version
+            view = self._facts[:]   # shallow snapshot of the fact list
             err = self._last_error
             updated = self._last_updated
 
-        cache_key = (period, since or "", _filter_key(flt))
+        cache_key = (period, since or "", start or "", end or "", _filter_key(flt))
         with self._cache_lock:
-            if n != self._cache_version:        # new events → whole cache stale
+            if version != self._cache_version:  # facts changed → whole cache stale
                 self._cache.clear()
-                self._cache_version = n
+                self._cache_version = version
             base = self._cache.get(cache_key)
 
         if base is None:
@@ -707,13 +820,13 @@ class UsageMonitor:
                 "label": label, "start_ms": start_ms, "end_ms": end_ms, "period": period,
             }
             with self._cache_lock:
-                if n == self._cache_version:    # still fresh — store it
+                if version == self._cache_version:  # still fresh — store it
                     self._cache[cache_key] = base
 
-        # Re-stamp volatile fields on a deep copy so the cached base stays
-        # isolated — a consumer mutating the returned payload can't corrupt it.
-        # The aggregated payload is small (bounded models/buckets/breakdowns),
-        # so this copy is far cheaper than re-running O(events) aggregation.
+        # Deep-copy the cached base so the cached aggregate stays isolated — a
+        # consumer that mutates the returned payload can't corrupt it. The
+        # payload is small (bounded models/buckets/breakdowns), so this is far
+        # cheaper than re-running O(events) aggregation.
         payload = copy.deepcopy(base)
         payload["generated_at"] = (updated or datetime.now(timezone.utc)).isoformat()
         payload["now_ms"] = _now_ms()
@@ -723,6 +836,44 @@ class UsageMonitor:
             payload["warning"] = {"code": err[0], "message": err[1]}
         return payload
 
+    def recent(self, limit: int = 20, region: str | None = None) -> list[dict]:
+        """Return the most recent retained events (newest first) as display rows."""
+        with self._lock:
+            facts = self._facts if not region else [f for f in self._facts if f["region"] == region]
+            # nlargest is O(n) + O(limit log limit) and returns newest-first.
+            rows = heapq.nlargest(limit, facts, key=lambda f: f["t"])
+        return [_recent_row(f) for f in rows]
+
+    def fetch_event(self, region: str | None, event_id: str, t_ms: int,
+                    pad_ms: int = 120_000) -> dict:
+        """Re-read a single invocation's full record from CloudWatch on demand.
+
+        Used to show the request/response bodies for one event. The content is
+        fetched live and never persisted — it stays only in CloudWatch.
+        """
+        if not event_id:
+            return {"error": "missing event id"}
+        by_region = dict(self._clients)
+        targets = [(region, by_region[region])] if region in by_region else self._clients
+        for _reg, client in targets:
+            try:
+                for r in iter_log_events(client, t_ms - pad_ms, t_ms + pad_ms):
+                    if r.get("_eventId") == event_id:
+                        return _event_detail(r)
+            except ClientError as exc:
+                return {"error": exc.response["Error"]["Code"]}
+        return {"error": "not found (it may have aged out of the log window)"}
+
+
+def _parse_window(qs: dict) -> tuple[int | None, int | None]:
+    """Parse optional absolute ?start=&end= (epoch ms) query params."""
+    try:
+        start = int(qs.get("start", [None])[0])
+        end = int(qs.get("end", [None])[0])
+        return start, end
+    except (TypeError, ValueError):
+        return None, None
+
 
 def _token_matches(presented: str | None, expected: str | None) -> bool:
     """Constant-time token check. expected=None means auth is disabled (always ok)."""
@@ -731,69 +882,21 @@ def _token_matches(presented: str | None, expected: str | None) -> bool:
     return presented is not None and hmac.compare_digest(presented, expected)
 
 
-def run_web(
-    clients,
-    bedrock_client,
-    host: str,
-    port: int,
-    token: str | None = None,
-    persist: bool = True,
-) -> None:
-    """Start the dashboard HTTP server and block until interrupted.
+def build_handler(monitor, alerter, config, token):
+    """Build the dashboard's HTTP request handler bound to the given dependencies.
 
-    The initial view is today's usage with alerts disabled; the time window,
-    threshold, webhook and refresh interval are all configured from the web UI.
-    When `token` is set, every route requires it (cookie, Bearer header, or
-    ?token= query) so the dashboard can be shared safely.
-    When `persist` is True, per-event facts are stored in SQLite so history
-    survives restarts and outlives CloudWatch log retention.
+    Extracted from run_web so the routing/auth layer can be exercised by HTTP
+    integration tests without standing up pricing or CloudWatch.
     """
-    regions = [r for r, _ in clients]
-    region_label = ", ".join(regions) or "unknown"
-    period   = "today"   # initial window; changed at runtime from the dashboard
-    threshold = None     # configured from the dashboard's Settings panel
-    webhook   = None
-    since     = None
-
-    console.print("[dim]Loading pricing data…[/dim]")
-    init_pricing_regions(regions, bedrock_client)
-
-    store = None
-    if persist:
-        try:
-            store = FactStore(_DB_PATH)
-            store.prune(_now_ms() - _DB_RETENTION_DAYS * 86_400_000)
-        except Exception as exc:  # noqa: BLE001 — fall back to in-memory on DB failure
-            console.print(f"[yellow]Persistence disabled ({exc}); running in-memory only.[/yellow]")
-            store = None
-
-    _, _, label = _resolve_window(period, since)
-    alerter = ThresholdAlerter(threshold, webhook, region=region_label, label=label, console=console)
-    monitor = UsageMonitor(clients, period, since, store=store, memory_window_days=_MEMORY_WINDOW_DAYS)
-    # Always wire the alert check; it's a no-op until a threshold is set (CLI or UI).
-    monitor._poll_callback = lambda: alerter.check(monitor.snapshot()["totals"]["cost"])
-    if store is not None:
-        console.print(
-            f"[dim]Persistence: {len(monitor._facts)} recent event(s) in memory, "
-            f"{store.count()} total on disk at {_DB_PATH} "
-            f"(memory window {_MEMORY_WINDOW_DAYS}d, kept {_DB_RETENTION_DAYS}d).[/dim]"
-        )
-
-    config = {
-        "refresh_seconds": REFRESH_SECONDS,
-        "region":          region_label,
-        "regions":         regions,
-        "threshold":       threshold,
-        "periods":         monitor.periods(),
-        "default_period":  monitor._default_period,
-        "bind":            f"{host}:{port}",
-        "poll_seconds":    REFRESH_SECONDS,
-    }
 
     class Handler(BaseHTTPRequestHandler):
         # Silence the default stderr request logging; we print our own startup line.
         def log_message(self, *args) -> None:  # noqa: D401
             pass
+
+        def _security_headers(self) -> None:
+            for k, v in _SECURITY_HEADERS.items():
+                self.send_header(k, v)
 
         def _send_json(self, obj: dict, status: int = 200) -> None:
             body = json.dumps(obj).encode("utf-8")
@@ -801,6 +904,7 @@ def run_web(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -814,6 +918,7 @@ def run_web(
                     "Set-Cookie",
                     f"bi_token={cookie}; HttpOnly; SameSite=Strict; Path=/",
                 )
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -823,6 +928,7 @@ def run_web(
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -832,6 +938,7 @@ def run_web(
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.send_header("Cache-Control", "no-store")
+            self._security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -876,23 +983,25 @@ def run_web(
                 qs = parse_qs(parsed.query)
                 period = qs.get("period", [None])[0]
                 since  = qs.get("since", [None])[0]
+                start, end = _parse_window(qs)
                 flt = {}
                 for dim in ("model", "identity", "region"):
                     val = qs.get(dim, [None])[0]
                     if val:
                         flt[dim] = val
-                self._send_json(monitor.snapshot(period, flt or None, since))
+                self._send_json(monitor.snapshot(period, flt or None, since, start, end))
             elif path == "/api/export":
                 qs = parse_qs(parsed.query)
                 fmt = (qs.get("format", ["json"])[0]).lower()
                 period = qs.get("period", [None])[0]
                 since  = qs.get("since", [None])[0]
+                start, end = _parse_window(qs)
                 flt = {}
                 for dim in ("model", "identity", "region"):
                     val = qs.get(dim, [None])[0]
                     if val:
                         flt[dim] = val
-                payload = monitor.snapshot(period, flt or None, since)
+                payload = monitor.snapshot(period, flt or None, since, start, end)
                 stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
                 if fmt == "csv":
                     self._send_attachment(
@@ -906,6 +1015,24 @@ def run_web(
                         "application/json; charset=utf-8",
                         f"bedrock-usage-{stamp}.json",
                     )
+            elif path == "/api/recent":
+                qs = parse_qs(parsed.query)
+                try:
+                    limit = int(qs.get("limit", ["20"])[0])
+                except ValueError:
+                    limit = 20
+                limit = max(1, min(limit, 200))
+                region = qs.get("region", [None])[0]
+                self._send_json({"events": monitor.recent(limit, region)})
+            elif path == "/api/event":
+                qs = parse_qs(parsed.query)
+                event_id = qs.get("id", [None])[0]
+                region = qs.get("region", [None])[0]
+                try:
+                    t = int(qs.get("t", ["0"])[0])
+                except (TypeError, ValueError):
+                    t = 0
+                self._send_json(monitor.fetch_event(region, event_id or "", t))
             elif path == "/metrics":
                 self._send_text(
                     render_prometheus(monitor.snapshot()),
@@ -919,7 +1046,9 @@ def run_web(
                 length = int(self.headers.get("Content-Length", 0))
             except (TypeError, ValueError):
                 length = 0
-            raw = self.rfile.read(length) if length > 0 else b""
+            if length <= 0 or length > _MAX_BODY_BYTES:
+                return {}
+            raw = self.rfile.read(length)
             try:
                 return json.loads(raw or b"{}")
             except (json.JSONDecodeError, ValueError):
@@ -957,6 +1086,77 @@ def run_web(
             else:
                 self._send_json({"error": "NotFound", "message": path}, status=404)
 
+    return Handler
+
+
+def run_web(
+    clients,
+    bedrock_client,
+    host: str,
+    port: int,
+    token: str | None = None,
+    persist: bool = True,
+) -> None:
+    """Start the dashboard HTTP server and block until interrupted.
+
+    The initial view is today's usage with alerts disabled; the time window,
+    threshold, webhook and refresh interval are all configured from the web UI.
+    When `token` is set, every route requires it (cookie, Bearer header, or
+    ?token= query) so the dashboard can be shared safely.
+    When `persist` is True, per-event facts are stored in SQLite so history
+    survives restarts and outlives CloudWatch log retention.
+    """
+    regions = [r for r, _ in clients]
+    region_label = ", ".join(regions) or "unknown"
+    period   = "today"   # initial window; changed at runtime from the dashboard
+    threshold = None     # configured from the dashboard's Settings panel
+    webhook   = None
+    since     = None
+
+    console.print("[dim]Loading pricing data…[/dim]")
+    init_pricing_regions(regions, bedrock_client)
+
+    store = None
+    if persist:
+        try:
+            store = FactStore(_DB_PATH)
+            store.prune(_now_ms() - _DB_RETENTION_DAYS * 86_400_000)
+        except Exception as exc:  # noqa: BLE001 — fall back to in-memory on DB failure
+            console.print(f"[yellow]Persistence disabled ({exc}); running in-memory only.[/yellow]")
+            store = None
+
+    _, _, label = _resolve_window(period, since)
+    alerter = ThresholdAlerter(threshold, webhook, region=region_label, label=label, console=console)
+    monitor = UsageMonitor(clients, period, since, store=store, memory_window_days=_MEMORY_WINDOW_DAYS)
+    # Wire the alert check, but skip the (cached) aggregation + payload copy
+    # entirely while no threshold is set or it has already fired — the common
+    # case — so the continuous poll loop stays cheap.
+    def _poll_alert() -> None:
+        if alerter.threshold is None or alerter.fired:
+            return
+        alerter.check(monitor.snapshot()["totals"]["cost"])
+
+    monitor._poll_callback = _poll_alert
+    if store is not None:
+        console.print(
+            f"[dim]Persistence: {len(monitor._facts)} recent event(s) in memory, "
+            f"{store.count()} total on disk at {_DB_PATH} "
+            f"(memory window {_MEMORY_WINDOW_DAYS}d, kept {_DB_RETENTION_DAYS}d).[/dim]"
+        )
+
+    config = {
+        "refresh_seconds": REFRESH_SECONDS,
+        "region":          region_label,
+        "regions":         regions,
+        "threshold":       threshold,
+        "periods":         monitor.periods(),
+        "default_period":  monitor._default_period,
+        "bind":            f"{host}:{port}",
+        "poll_seconds":    REFRESH_SECONDS,
+    }
+
+    Handler = build_handler(monitor, alerter, config, token)
+
     try:
         httpd = ThreadingHTTPServer((host, port), Handler)
     except OSError as exc:
@@ -981,7 +1181,8 @@ def run_web(
     # poller keep it fresh with cheap incremental queries.
     console.print("[dim]Loading initial data from CloudWatch…[/dim]")
     monitor.prime()
-    alerter.check(monitor.snapshot()["totals"]["cost"])  # initial load may already exceed
+    if alerter.threshold is not None:
+        alerter.check(monitor.snapshot()["totals"]["cost"])  # initial load may already exceed
     monitor.start()
 
     url = f"http://{host}:{port}"
@@ -1029,753 +1230,13 @@ border-radius:6px;padding:2px 6px;color:#58a6ff}</style></head>
 <p><code>?token=YOUR_TOKEN</code></p></div></body></html>"""
 
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Bedrock Insights</title>
-<style>
-  :root {
-    --bg: #0d1117;
-    --panel: #161b22;
-    --panel-2: #1c2230;
-    --border: #2a3340;
-    --text: #e6edf3;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --green: #3fb950;
-    --yellow: #d29922;
-    --magenta: #bc8cff;
-    --red: #f85149;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    font-size: 14px;
-  }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
-  header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
-  h1 { font-size: 20px; margin: 0; font-weight: 650; letter-spacing: .2px; }
-  h1 .dot { color: var(--accent); }
-  .meta { color: var(--muted); font-size: 12.5px; display: flex; gap: 16px; flex-wrap: wrap; }
-  .meta b { color: var(--text); font-weight: 600; }
-  .status { display: inline-flex; align-items: center; gap: 6px; }
-  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 0 rgba(63,185,80,.6); animation: pulse 2s infinite; }
-  .pulse.stale { background: var(--red); animation: none; }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(63,185,80,.5);} 70% { box-shadow: 0 0 0 6px rgba(63,185,80,0);} 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0);} }
-
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 22px 0; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
-  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .6px; }
-  .card .v { font-size: 26px; font-weight: 680; margin-top: 6px; font-variant-numeric: tabular-nums; }
-  .card.cost .v { color: var(--magenta); }
-  .card.calls .v { color: var(--text); }
-  .card.tokens .v { color: var(--green); }
-  .card .v.small { font-size: 20px; }
-
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; margin-bottom: 22px; position: relative; }
-  .panel-head { display: flex; justify-content: space-between; align-items: baseline; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 8px; }
-  .panel-head .sub { text-transform: none; letter-spacing: 0; }
-  canvas { width: 100%; display: block; }
-  .share { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
-  .share .bar { height: 6px; border-radius: 3px; background: var(--magenta); opacity: .55; min-width: 0; }
-
-  .card.errrate .v { color: var(--green); }
-  .card.errrate.has-errors .v { color: var(--red); }
-
-  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-top: 22px; }
-  .mini h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); font-weight: 600; }
-  .mini table { border: none; border-radius: 0; }
-  .mini thead th { padding: 6px 8px; }
-  .mini tbody td { padding: 7px 8px; }
-  .mini .empty { padding: 18px 0; }
-  .err-code { color: var(--red); font-weight: 600; text-align: left; }
-  .err-rate-line { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
-  .err-rate-line b { color: var(--red); }
-
-  .banner { display: none; background: rgba(248,81,73,.12); border: 1px solid var(--red); color: #ffb4ad; border-radius: 10px; padding: 12px 16px; margin: 4px 0 18px; font-weight: 600; }
-  .banner.show { display: block; }
-
-  .warn { display: none; background: rgba(210,153,34,.12); border: 1px solid var(--yellow); color: #f0c674; border-radius: 10px; padding: 10px 14px; margin: 4px 0 16px; font-size: 13px; }
-  .warn.show { display: block; }
-
-  .toolbar { display: flex; align-items: center; gap: 12px; margin: 18px 0 4px; flex-wrap: wrap; }
-  .periods { display: inline-flex; gap: 6px; }
-  .periods button { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; transition: all .12s; }
-  .periods button:hover { color: var(--text); border-color: var(--accent); }
-  .periods button.active { background: var(--accent); color: #06223f; border-color: var(--accent); font-weight: 650; }
-  .filter-chip { background: rgba(88,166,255,.12); border: 1px solid var(--accent); color: var(--accent); border-radius: 8px; padding: 5px 10px; font-size: 12.5px; display: none; align-items: center; gap: 8px; }
-  .filter-chip.show { display: inline-flex; }
-  .filter-chip button { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 15px; padding: 0; line-height: 1; }
-  tr.clickable { cursor: pointer; }
-  .gear { margin-left: auto; background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
-  .gear:hover { color: var(--text); border-color: var(--accent); }
-  .settings h3 { margin: 0 0 14px; font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
-  .setrow { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; max-width: 520px; }
-  .setrow label { font-size: 12.5px; color: var(--text); }
-  .setrow label .muted { color: var(--muted); }
-  .setrow input { background: var(--bg); border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; color: var(--text); font-size: 13px; font-family: inherit; }
-  .setrow input:focus { outline: none; border-color: var(--accent); }
-  .setactions { display: flex; align-items: center; gap: 10px; }
-  .setactions button { background: var(--accent); color: #06223f; border: none; border-radius: 7px; padding: 7px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
-  .setactions button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
-  .setactions button:hover { filter: brightness(1.08); }
-  .setstatus { font-size: 12.5px; color: var(--muted); }
-  .setstatus.ok { color: var(--green); }
-  .setstatus.bad { color: var(--red); }
-  .setnote { font-size: 11.5px; color: var(--muted); margin-top: 12px; max-width: 520px; }
-  .tip { position: absolute; pointer-events: none; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; font-size: 11.5px; color: var(--text); white-space: nowrap; display: none; z-index: 10; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
-  .tip .tcost { color: var(--magenta); font-weight: 600; }
-
-  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-  thead th { text-align: right; font-size: 11.5px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 600; }
-  thead th:first-child { text-align: left; }
-  tbody td { padding: 11px 14px; text-align: right; font-variant-numeric: tabular-nums; border-bottom: 1px solid rgba(42,51,64,.5); }
-  tbody td:first-child { text-align: left; color: var(--accent); font-weight: 600; }
-  tbody tr:last-child td { border-bottom: none; }
-  tbody tr:hover { background: var(--panel-2); }
-  .col-in { color: var(--green); }
-  .col-out { color: var(--yellow); }
-  .col-cache { color: var(--accent); }
-  .col-cost { color: var(--magenta); font-weight: 600; }
-  .na { color: var(--muted); font-style: italic; }
-  .badge { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; margin-left: 7px; vertical-align: middle; }
-  tfoot td { padding: 13px 14px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; border-top: 2px solid var(--border); background: var(--panel-2); }
-  tfoot td:first-child { text-align: left; }
-
-  .empty { text-align: center; color: var(--muted); padding: 50px 0; font-style: italic; }
-  .err { background: rgba(248,81,73,.1); border: 1px solid var(--red); color: #ffb4ad; border-radius: 10px; padding: 14px 16px; }
-  footer { color: var(--muted); font-size: 12px; margin-top: 18px; text-align: right; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1>Bedrock<span class="dot">.</span>Insights</h1>
-    <div class="meta">
-      <span>Region <b id="region">—</b></span>
-      <span>Window <b id="label">—</b></span>
-      <span class="status"><span class="pulse" id="pulse"></span><b id="updated">connecting…</b></span>
-    </div>
-  </header>
-
-  <div class="banner" id="banner"></div>
-  <div class="warn" id="warn"></div>
-
-  <div class="toolbar">
-    <div class="periods" id="periods"></div>
-    <div class="periods" id="region-sel"></div>
-    <div class="filter-chip" id="filter-chip"></div>
-    <button class="gear" id="export-json" title="Download current view as JSON">↓ JSON</button>
-    <button class="gear" id="export-csv" title="Download current view as CSV">↓ CSV</button>
-    <button class="gear" id="gear" title="Settings">⚙ Settings</button>
-  </div>
-
-  <div class="panel settings" id="settings" style="display:none">
-    <h3>Time window</h3>
-    <div class="setrow">
-      <label>Custom rolling window <span class="muted">— e.g. 2h, 30m, 1d (overrides the period buttons)</span></label>
-      <div class="setactions">
-        <input id="set-since" type="text" placeholder="leave blank to use the period buttons" style="max-width:240px">
-        <button id="set-window-apply">Apply</button>
-        <button id="set-window-clear" class="secondary">Clear</button>
-      </div>
-    </div>
-
-    <h3 style="margin-top:18px">Alerts</h3>
-    <div class="setrow">
-      <label>Threshold ($) <span class="muted">— leave blank to disable</span></label>
-      <input id="set-threshold" type="number" step="0.01" min="0" placeholder="disabled">
-    </div>
-    <div class="setrow">
-      <label>Webhook URL <span class="muted">(Slack incoming webhook or any JSON endpoint)</span></label>
-      <input id="set-webhook" type="text" placeholder="https://hooks.slack.com/services/...">
-    </div>
-    <div class="setactions">
-      <button id="set-save">Save</button>
-      <button id="set-test" class="secondary">Send test</button>
-      <span id="set-status" class="setstatus"></span>
-    </div>
-    <div class="setnote">Alerts fire once when spend crosses the threshold (re-armed when you change settings). The server POSTs to this URL, so only use a webhook you trust — and don't expose the dashboard publicly.</div>
-
-    <h3 style="margin-top:18px">Display</h3>
-    <div class="setrow">
-      <label>Dashboard refresh interval (seconds)</label>
-      <div class="setactions">
-        <input id="set-refresh" type="number" min="2" step="1" style="max-width:120px">
-        <button id="set-refresh-apply">Apply</button>
-      </div>
-    </div>
-
-    <h3 style="margin-top:18px">Runtime <span class="muted">(set at launch — restart with CLI flags to change)</span></h3>
-    <div class="setnote">
-      Regions monitored: <b id="info-regions">—</b><br>
-      Server bind address (<code>--host</code>/<code>--port</code>): <b id="info-bind">—</b><br>
-      CloudWatch poll interval: <b id="info-poll">—</b>s
-    </div>
-  </div>
-
-  <div class="cards">
-    <div class="card cost"><div class="k">Estimated Cost</div><div class="v" id="c-cost">—</div></div>
-    <div class="card calls"><div class="k">Total Calls</div><div class="v" id="c-calls">—</div></div>
-    <div class="card tokens"><div class="k">Total Tokens</div><div class="v" id="c-tokens">—</div></div>
-    <div class="card"><div class="k">Avg $ / Call</div><div class="v small" id="c-avgcost">—</div></div>
-    <div class="card"><div class="k">Burn Rate</div><div class="v small" id="c-burn">—</div></div>
-    <div class="card"><div class="k">Proj. $ / Day</div><div class="v small" id="c-proj" title="Run-rate estimate">—</div></div>
-    <div class="card errrate" id="card-err"><div class="k">Error Rate</div><div class="v small" id="c-err">—</div></div>
-    <div class="card" id="card-cache" style="display:none"><div class="k">Cache Hit Rate</div><div class="v small" id="c-cache">—</div></div>
-  </div>
-
-  <div class="panel" id="chart-panel">
-    <div class="panel-head"><span>Cost over time</span><span class="sub" id="chart-meta"></span></div>
-    <canvas id="chart" height="140"></canvas>
-    <div class="tip" id="chart-tip"></div>
-  </div>
-
-  <div id="content"></div>
-
-  <div class="grid2">
-    <div class="panel mini"><h3>By IAM Identity</h3><div id="bd-identity"></div></div>
-    <div class="panel mini"><h3>By Region</h3><div id="bd-region"></div></div>
-    <div class="panel mini" id="panel-errors" style="display:none"><h3>Errors</h3><div id="bd-errors"></div></div>
-  </div>
-
-  <footer id="foot"></footer>
-</div>
-
-<script>
-let CONFIG = { refresh_seconds: 5, threshold: null, periods: [], regions: [] };
-let STATE = { period: null, region: null, since: null, filter: null };  // filter = {dim, value, label}
-let REFRESH_TIMER = null;
-
-function escAttr(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
-}
-
-function _windowParams(p) {
-  // A custom `since` overrides the named period.
-  if (STATE.since) p.set("since", STATE.since);
-  else if (STATE.period) p.set("period", STATE.period);
-  if (STATE.region) p.set("region", STATE.region);
-  if (STATE.filter) p.set(STATE.filter.dim, STATE.filter.value);
-}
-
-function buildUsageUrl() {
-  const p = new URLSearchParams();
-  _windowParams(p);
-  const q = p.toString();
-  return "/api/usage" + (q ? "?" + q : "");
-}
-
-function downloadExport(fmt) {
-  const p = new URLSearchParams();
-  p.set("format", fmt);
-  _windowParams(p);
-  const a = document.createElement("a");
-  a.href = "/api/export?" + p.toString();
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-function applyRefreshInterval(seconds) {
-  const s = Math.max(2, Number(seconds) || CONFIG.refresh_seconds || 5);
-  if (REFRESH_TIMER) clearInterval(REFRESH_TIMER);
-  REFRESH_TIMER = setInterval(refresh, s * 1000);
-  document.getElementById("foot").textContent =
-    "Refreshing every " + s + "s · CloudWatch polled every " + (CONFIG.poll_seconds || 5) + "s";
-}
-
-function setCustomWindow(since) {
-  STATE.since = since || null;
-  if (STATE.since) {
-    // Custom window overrides the period buttons — clear their active state.
-    for (const b of document.querySelectorAll("#periods button")) b.classList.remove("active");
-  }
-  refresh();
-}
-
-function setRegion(region) {
-  STATE.region = region || null;
-  for (const b of document.querySelectorAll("#region-sel button"))
-    b.classList.toggle("active", (b.dataset.region || null) === STATE.region);
-  refresh();
-}
-
-function setFilter(dim, value, label) {
-  STATE.filter = { dim, value, label };
-  renderFilterChip();
-  refresh();
-}
-
-function clearFilter() {
-  STATE.filter = null;
-  renderFilterChip();
-  refresh();
-}
-
-function renderFilterChip() {
-  const chip = document.getElementById("filter-chip");
-  if (!STATE.filter) { chip.classList.remove("show"); chip.innerHTML = ""; return; }
-  chip.classList.add("show");
-  chip.innerHTML = "Filter: <b>" + STATE.filter.dim + "</b> = " +
-    escAttr(STATE.filter.label) + ' <button title="Clear filter" onclick="clearFilter()">✕</button>';
-}
-
-function setPeriod(id) {
-  STATE.period = id;
-  STATE.since = null;                       // a named period overrides a custom window
-  document.getElementById("set-since").value = "";
-  for (const b of document.querySelectorAll("#periods button"))
-    b.classList.toggle("active", b.dataset.id === id);
-  refresh();
-}
-
-let SETTINGS = { threshold: null, webhook_url: null };
-
-async function loadSettings() {
-  try {
-    const r = await fetch("/api/settings");
-    SETTINGS = await r.json();
-    document.getElementById("set-threshold").value =
-      (SETTINGS.threshold === null || SETTINGS.threshold === undefined) ? "" : SETTINGS.threshold;
-    document.getElementById("set-webhook").value = SETTINGS.webhook_url || "";
-  } catch (e) { /* ignore */ }
-}
-
-function setStatus(msg, kind) {
-  const el = document.getElementById("set-status");
-  el.textContent = msg;
-  el.className = "setstatus" + (kind ? " " + kind : "");
-}
-
-async function saveSettings() {
-  const tv = document.getElementById("set-threshold").value.trim();
-  const wv = document.getElementById("set-webhook").value.trim();
-  setStatus("Saving…");
-  try {
-    const r = await fetch("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ threshold: tv === "" ? null : tv, webhook_url: wv || null }),
-    });
-    const data = await r.json();
-    if (data.error) { setStatus(data.error, "bad"); return; }
-    SETTINGS = data;
-    setStatus("Saved.", "ok");
-  } catch (e) {
-    setStatus("Save failed.", "bad");
-  }
-}
-
-async function testWebhook() {
-  const wv = document.getElementById("set-webhook").value.trim();
-  if (!wv) { setStatus("Enter a webhook URL first.", "bad"); return; }
-  setStatus("Sending test…");
-  try {
-    const r = await fetch("/api/test-webhook", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ webhook_url: wv }),
-    });
-    const data = await r.json();
-    setStatus(data.ok ? "Test sent (HTTP " + data.message + ")." : "Failed: " + data.message,
-              data.ok ? "ok" : "bad");
-  } catch (e) {
-    setStatus("Test failed.", "bad");
-  }
-}
-
-function fmtTokens(n) {
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-  if (n >= 1e4) return (n / 1e3).toFixed(1) + "K";
-  return n.toLocaleString();
-}
-function fmtCost(c) { return "$" + c.toFixed(4); }
-function fmtPct(x) { return (x * 100).toFixed(1) + "%"; }
-
-let CHART = null;  // last-drawn geometry, for hover tooltips
-
-function renderChart(trend) {
-  const canvas = document.getElementById("chart");
-  const pts = (trend && trend.points) || [];
-  const bs = trend ? trend.bucket_seconds : 60;
-  const bucketLabel = bs >= 3600 ? (bs / 3600) + "h" : (bs / 60) + "m";
-  document.getElementById("chart-meta").textContent =
-    pts.length ? (pts.length + " × " + bucketLabel + " buckets") : "";
-
-  const dpr = window.devicePixelRatio || 1;
-  const cssW = canvas.clientWidth || (canvas.parentElement.clientWidth - 32);
-  const cssH = 140;
-  canvas.width = cssW * dpr;
-  canvas.height = cssH * dpr;
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssW, cssH);
-  CHART = null;
-
-  if (!pts.length) {
-    ctx.fillStyle = "#8b949e"; ctx.font = "12px sans-serif";
-    ctx.fillText("No data in this window yet…", 8, 22);
-    return;
-  }
-
-  const pad = { l: 8, r: 8, t: 14, b: 18 };
-  const w = cssW - pad.l - pad.r, h = cssH - pad.t - pad.b;
-  const maxCost = Math.max.apply(null, pts.map(p => p.cost).concat(1e-9));
-  const n = pts.length;
-  const slot = w / n;
-  const bw = Math.max(1, slot - 2);
-
-  ctx.strokeStyle = "#2a3340";
-  ctx.beginPath(); ctx.moveTo(pad.l, pad.t + h); ctx.lineTo(pad.l + w, pad.t + h); ctx.stroke();
-
-  for (let i = 0; i < n; i++) {
-    const bh = (pts[i].cost / maxCost) * h;
-    ctx.fillStyle = "#bc8cff";
-    ctx.fillRect(pad.l + i * slot + 1, pad.t + h - bh, bw, bh);
-  }
-
-  const fmtT = ms => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  ctx.fillStyle = "#8b949e"; ctx.font = "10px sans-serif";
-  ctx.textAlign = "left";
-  ctx.fillText("$" + maxCost.toFixed(maxCost < 0.01 ? 5 : 4), pad.l, 10);
-  ctx.fillText(fmtT(pts[0].t), pad.l, cssH - 4);
-  ctx.textAlign = "right";
-  ctx.fillText(fmtT(pts[n - 1].t), pad.l + w, cssH - 4);
-
-  // Stash geometry so the hover handler can map cursor x → bucket.
-  CHART = { pad, slot, w, n, pts, bucketSeconds: bs };
-}
-
-function _chartHover(e) {
-  const tip = document.getElementById("chart-tip");
-  if (!CHART) { tip.style.display = "none"; return; }
-  const canvas = document.getElementById("chart");
-  const rect = canvas.getBoundingClientRect();
-  const x = e.clientX - rect.left;
-  const i = Math.floor((x - CHART.pad.l) / CHART.slot);
-  if (i < 0 || i >= CHART.n) { tip.style.display = "none"; return; }
-
-  const p = CHART.pts[i];
-  const fmtT = ms => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  const end = p.t + CHART.bucketSeconds * 1000;
-  tip.innerHTML =
-    "<div>" + fmtT(p.t) + "–" + fmtT(end) + "</div>" +
-    '<div class="tcost">' + fmtCost(p.cost) + "</div>" +
-    "<div>" + fmtTokens(p.total_tokens) + " tokens · " + p.calls + " calls</div>";
-
-  // Position above the hovered bar, clamped inside the panel.
-  const panel = document.getElementById("chart-panel");
-  const prect = panel.getBoundingClientRect();
-  tip.style.display = "block";
-  const tw = tip.offsetWidth;
-  let left = (rect.left - prect.left) + CHART.pad.l + i * CHART.slot + CHART.slot / 2 - tw / 2;
-  left = Math.max(4, Math.min(left, panel.clientWidth - tw - 4));
-  tip.style.left = left + "px";
-  tip.style.top = ((rect.top - prect.top) + 6) + "px";
-}
-
-(function bindChartHover() {
-  const canvas = document.getElementById("chart");
-  canvas.addEventListener("mousemove", _chartHover);
-  canvas.addEventListener("mouseleave", () => {
-    document.getElementById("chart-tip").style.display = "none";
-  });
-})();
-
-function setStale(stale) {
-  document.getElementById("pulse").classList.toggle("stale", stale);
-}
-
-async function loadConfig() {
-  try {
-    const r = await fetch("/api/config");
-    CONFIG = await r.json();
-    document.getElementById("region").textContent = CONFIG.region || "—";
-    STATE.period = CONFIG.default_period;
-    const box = document.getElementById("periods");
-    box.innerHTML = "";
-    for (const p of (CONFIG.periods || [])) {
-      const btn = document.createElement("button");
-      btn.textContent = p.label;
-      btn.dataset.id = p.id;
-      btn.classList.toggle("active", p.id === STATE.period);
-      btn.addEventListener("click", () => setPeriod(p.id));
-      box.appendChild(btn);
-    }
-
-    // Region selector — only when monitoring more than one region.
-    const rsel = document.getElementById("region-sel");
-    rsel.innerHTML = "";
-    const regions = CONFIG.regions || [];
-    if (regions.length > 1) {
-      const mk = (label, val) => {
-        const b = document.createElement("button");
-        b.textContent = label;
-        b.dataset.region = val;
-        b.classList.toggle("active", (val || null) === STATE.region);
-        b.addEventListener("click", () => setRegion(val));
-        return b;
-      };
-      rsel.appendChild(mk("All regions", ""));
-      for (const r of regions) rsel.appendChild(mk(r, r));
-    }
-
-    // Read-only runtime info + refresh default
-    document.getElementById("info-regions").textContent = (regions.length ? regions.join(", ") : CONFIG.region) || "—";
-    document.getElementById("info-bind").textContent = CONFIG.bind || "—";
-    document.getElementById("info-poll").textContent = CONFIG.poll_seconds || "—";
-    document.getElementById("set-refresh").value = CONFIG.refresh_seconds || 5;
-  } catch (e) { /* keep defaults */ }
-}
-
-// Click a model / identity row to drill in; click a region row to switch region.
-document.addEventListener("click", (e) => {
-  const tr = e.target.closest("tr.clickable");
-  if (!tr || !tr.dataset.dim) return;
-  if (tr.dataset.dim === "region") setRegion(tr.dataset.val);
-  else setFilter(tr.dataset.dim, tr.dataset.val, tr.dataset.label);
-});
-
-function renderError(msg) {
-  document.getElementById("content").innerHTML =
-    '<div class="err"><b>Could not load usage.</b><br>' + msg + "</div>";
-}
-
-function renderBanner(totals) {
-  const banner = document.getElementById("banner");
-  const threshold = (SETTINGS.threshold != null) ? SETTINGS.threshold : CONFIG.threshold;
-  if (threshold != null && totals.cost_known && totals.cost >= threshold) {
-    banner.textContent = "⚠  Threshold exceeded — " + fmtCost(totals.cost) +
-      " ≥ $" + Number(threshold).toFixed(2);
-    banner.classList.add("show");
-  } else {
-    banner.classList.remove("show");
-  }
-}
-
-function renderTable(data) {
-  const hasCache = data.has_cache;
-  const t = data.totals;
-
-  if (!data.models.length) {
-    document.getElementById("content").innerHTML =
-      '<div class="empty">Waiting for Bedrock invocations in this window…</div>';
-    return;
-  }
-
-  let head = "<tr><th>Model</th><th>Calls</th><th>Input</th>";
-  if (hasCache) head += "<th>Cache Write</th><th>Cache Read</th>";
-  head += "<th>Output</th>";
-  if (!hasCache) head += "<th>Total</th>";
-  head += "<th>Est. Cost</th><th>Share</th></tr>";
-
-  let rows = "";
-  for (const m of data.models) {
-    const cost = m.price_known ? '<td class="col-cost">' + fmtCost(m.cost) + "</td>"
-                               : '<td class="na">N/A</td>';
-    const share = m.cost_share || 0;
-    const shareCell = '<td><div class="share"><span>' + fmtPct(share) +
-                      '</span><span class="bar" style="width:' + Math.round(share * 60) + 'px"></span></div></td>';
-    const badge = m.is_global ? '<span class="badge">global</span>' : "";
-    rows += '<tr class="clickable" data-dim="model" data-val="' + escAttr(m.model_id) +
-            '" data-label="' + escAttr(m.display_name) + '"><td>' + m.display_name + badge + "</td>" +
-            "<td>" + m.calls.toLocaleString() + "</td>" +
-            '<td class="col-in">' + fmtTokens(m.input_tokens) + "</td>";
-    if (hasCache) rows += '<td class="col-cache">' + fmtTokens(m.cache_write_tokens) + "</td>" +
-                          '<td class="col-cache">' + fmtTokens(m.cache_read_tokens) + "</td>";
-    rows += '<td class="col-out">' + fmtTokens(m.output_tokens) + "</td>";
-    if (!hasCache) rows += "<td>" + fmtTokens(m.total_tokens) + "</td>";
-    rows += cost + shareCell + "</tr>";
-  }
-
-  const totalCost = t.cost_known ? '<td class="col-cost">' + fmtCost(t.cost) + "</td>"
-                                 : '<td class="na">N/A</td>';
-  let foot = "<tr><td>TOTAL</td><td>" + t.calls.toLocaleString() + "</td>" +
-             "<td>" + fmtTokens(t.input_tokens) + "</td>";
-  if (hasCache) foot += "<td>" + fmtTokens(t.cache_write_tokens) + "</td>" +
-                        "<td>" + fmtTokens(t.cache_read_tokens) + "</td>";
-  foot += "<td>" + fmtTokens(t.output_tokens) + "</td>";
-  if (!hasCache) foot += "<td>" + fmtTokens(t.total_tokens) + "</td>";
-  foot += totalCost + "<td></td></tr>";
-
-  document.getElementById("content").innerHTML =
-    "<table><thead>" + head + "</thead><tbody>" + rows +
-    "</tbody><tfoot>" + foot + "</tfoot></table>";
-}
-
-function renderBreakdownTable(rows, cols, rowMeta) {
-  if (!rows.length) return '<div class="empty">No data yet…</div>';
-  let head = "<tr>";
-  for (const c of cols) head += "<th" + (c.left ? ' style="text-align:left"' : "") + ">" + c.label + "</th>";
-  head += "</tr>";
-  let body = "";
-  for (const r of rows) {
-    let attrs = "";
-    if (rowMeta) {
-      const meta = rowMeta(r);
-      attrs = ' class="clickable" data-dim="' + meta.dim + '" data-val="' +
-              escAttr(meta.val) + '" data-label="' + escAttr(meta.label) + '"';
-    }
-    body += "<tr" + attrs + ">";
-    for (const c of cols) body += "<td>" + c.render(r) + "</td>";
-    body += "</tr>";
-  }
-  return "<table><thead>" + head + "</thead><tbody>" + body + "</tbody></table>";
-}
-
-function renderIdentities(list) {
-  const cols = [
-    { label: "Identity", left: true, render: r => r.errors > 0
-        ? r.label + ' <span class="badge" style="border-color:var(--red);color:var(--red)">' + r.errors + ' err</span>'
-        : r.label },
-    { label: "Calls", render: r => r.calls.toLocaleString() },
-    { label: "Cost",  render: r => '<span class="col-cost">' + fmtCost(r.cost) + "</span>" },
-    { label: "Share", render: r => fmtPct(r.cost_share || 0) },
-  ];
-  document.getElementById("bd-identity").innerHTML = renderBreakdownTable(
-    list || [], cols, r => ({ dim: "identity", val: r.key, label: r.label }));
-}
-
-function renderRegions(list) {
-  const cols = [
-    { label: "Region", left: true, render: r => r.region },
-    { label: "Calls",  render: r => r.calls.toLocaleString() },
-    { label: "Cost",   render: r => '<span class="col-cost">' + fmtCost(r.cost) + "</span>" },
-    { label: "Share",  render: r => fmtPct(r.cost_share || 0) },
-  ];
-  // Rows are clickable (→ switch region) only when there's a selector to switch with.
-  const meta = (CONFIG.regions || []).length > 1
-    ? r => ({ dim: "region", val: r.region, label: r.region })
-    : null;
-  document.getElementById("bd-region").innerHTML = renderBreakdownTable(list || [], cols, meta);
-}
-
-function renderErrors(errors) {
-  const panel = document.getElementById("panel-errors");
-  if (!errors || !errors.total) { panel.style.display = "none"; return; }
-  panel.style.display = "";
-  let html = '<div class="err-rate-line"><b>' + errors.total.toLocaleString() +
-             "</b> failed call(s) · " + fmtPct(errors.rate) + " error rate</div>";
-  const cols = [
-    { label: "Error Code", left: true, render: r => '<span class="err-code">' + r.code + "</span>" },
-    { label: "Count", render: r => r.count.toLocaleString() },
-  ];
-  html += renderBreakdownTable(errors.by_code || [], cols);
-  document.getElementById("bd-errors").innerHTML = html;
-}
-
-async function refresh() {
-  try {
-    const r = await fetch(buildUsageUrl());
-    const data = await r.json();
-    if (data.error) { renderError(data.message || data.error); setStale(true); return; }
-
-    // A warning means the background poller hit an error, but we still have
-    // the last good cached data — show the notice and keep rendering it.
-    const warn = document.getElementById("warn");
-    if (data.warning) {
-      warn.textContent = "⚠ " + data.warning.code + ": " + data.warning.message +
-        " — showing last known data.";
-      warn.classList.add("show");
-    } else {
-      warn.classList.remove("show");
-    }
-
-    document.getElementById("c-cost").textContent =
-      data.totals.cost_known ? fmtCost(data.totals.cost) : "N/A";
-    document.getElementById("c-calls").textContent = data.totals.calls.toLocaleString();
-    document.getElementById("c-tokens").textContent = fmtTokens(data.totals.total_tokens);
-
-    // Avg cost per call
-    document.getElementById("c-avgcost").textContent =
-      data.totals.cost_known && data.totals.calls ? "$" + data.totals.avg_cost_per_call.toFixed(5) : "—";
-
-    // Burn rate = cost so far / hours elapsed since the window start.
-    const nowMs = data.now_ms || Date.now();
-    const startMs = (data.window && data.window.start_ms) || nowMs;
-    const hours = Math.max((nowMs - startMs) / 3.6e6, 1 / 60);
-    document.getElementById("c-burn").textContent =
-      data.totals.cost_known && data.totals.cost > 0 ? "$" + (data.totals.cost / hours).toFixed(4) + "/hr" : "—";
-
-    // Run-rate projection (server-computed).
-    const proj = data.projection;
-    if (proj && data.totals.cost_known && data.totals.cost > 0) {
-      document.getElementById("c-proj").textContent = "$" + proj.projected_daily.toFixed(2);
-      document.getElementById("c-proj").title =
-        "Run-rate estimate · ~$" + proj.projected_monthly.toFixed(0) + "/month";
-    } else {
-      document.getElementById("c-proj").textContent = "—";
-    }
-
-    // Cache hit rate card (only when caching is in use).
-    const cacheCard = document.getElementById("card-cache");
-    if (data.has_cache) {
-      cacheCard.style.display = "";
-      document.getElementById("c-cache").textContent = fmtPct(data.totals.cache_hit_rate);
-    } else {
-      cacheCard.style.display = "none";
-    }
-
-    // Error rate card — turns red when any call has failed.
-    const errors = data.errors || { total: 0, rate: 0, by_code: [] };
-    document.getElementById("c-err").textContent = fmtPct(errors.rate);
-    document.getElementById("card-err").classList.toggle("has-errors", errors.total > 0);
-
-    renderBanner(data.totals);
-    renderChart(data.trend);
-    renderTable(data);
-    renderIdentities(data.identities);
-    renderRegions(data.regions);
-    renderErrors(errors);
-
-    const now = new Date();
-    document.getElementById("updated").textContent = "updated " + now.toLocaleTimeString();
-    if (data.window && data.window.label) document.getElementById("label").textContent = data.window.label;
-    setStale(!!data.warning);
-  } catch (e) {
-    document.getElementById("updated").textContent = "connection lost — retrying";
-    setStale(true);
-  }
-}
-
-(async function () {
-  // The cookie is already set by the page response; drop the token from the
-  // address bar so it doesn't linger in history or get shared accidentally.
-  if (location.search.includes("token=")) {
-    history.replaceState({}, "", location.pathname);
-  }
-  await loadConfig();
-  await loadSettings();
-
-  document.getElementById("gear").addEventListener("click", () => {
-    const el = document.getElementById("settings");
-    const showing = el.style.display !== "none";
-    el.style.display = showing ? "none" : "block";
-    if (!showing) loadSettings();
-  });
-  document.getElementById("set-save").addEventListener("click", saveSettings);
-  document.getElementById("set-test").addEventListener("click", testWebhook);
-  document.getElementById("export-json").addEventListener("click", () => downloadExport("json"));
-  document.getElementById("export-csv").addEventListener("click", () => downloadExport("csv"));
-  document.getElementById("set-window-apply").addEventListener("click",
-    () => setCustomWindow(document.getElementById("set-since").value.trim()));
-  document.getElementById("set-window-clear").addEventListener("click", () => {
-    document.getElementById("set-since").value = "";
-    setPeriod(STATE.period || CONFIG.default_period);
-  });
-  document.getElementById("set-refresh-apply").addEventListener("click",
-    () => applyRefreshInterval(document.getElementById("set-refresh").value));
-
-  await refresh();
-  applyRefreshInterval(CONFIG.refresh_seconds);
-})();
-</script>
-</body>
-</html>
-"""
+def _build_dashboard_html() -> str:
+    """Assemble the self-contained dashboard page from its HTML/CSS/JS parts."""
+    return (
+        _load_static("dashboard.html")
+        .replace("/*__APP_CSS__*/", _load_static("app.css"))
+        .replace("//__APP_JS__", _load_static("app.js"))
+    )
+
+
+DASHBOARD_HTML = _build_dashboard_html()
