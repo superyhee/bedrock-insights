@@ -89,9 +89,15 @@ def test_alerter_configure_rearms(monkeypatch):
 
 def test_alerter_settings_roundtrip():
     a = ThresholdAlerter(None, None)
-    assert a.settings() == {"threshold": None, "webhook_url": None}
-    a.configure(3.5, "https://hooks.example/x")
-    assert a.settings() == {"threshold": 3.5, "webhook_url": "https://hooks.example/x"}
+    assert a.settings() == {
+        "threshold": None, "webhook_url": None,
+        "daily_budget": None, "monthly_budget": None,
+    }
+    a.configure(3.5, "https://hooks.example/x", 10.0, 200.0)
+    assert a.settings() == {
+        "threshold": 3.5, "webhook_url": "https://hooks.example/x",
+        "daily_budget": 10.0, "monthly_budget": 200.0,
+    }
 
 
 def test_alerter_send_test_uses_given_url(monkeypatch):
@@ -108,3 +114,41 @@ def test_alerter_send_test_no_url():
     a = ThresholdAlerter(None, None)
     ok, info = a.send_test(None)
     assert ok is False
+
+
+# ── budgets (warning / critical, per-period dedup) ───────────────────────────
+def test_budget_warning_then_critical(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notify, "send_webhook",
+                        lambda u, p, timeout=10: sent.append(p) or (True, "200"))
+    a = ThresholdAlerter(None, "https://hooks.example/x", daily_budget=10.0)
+    assert a.check_budgets(8.5, 0, "2026-06-30", "2026-06") == [("daily", "warning")]
+    assert a.check_budgets(8.6, 0, "2026-06-30", "2026-06") == []          # same level, quiet
+    assert a.check_budgets(10.0, 0, "2026-06-30", "2026-06") == [("daily", "critical")]
+    assert a.check_budgets(12.0, 0, "2026-06-30", "2026-06") == []          # already critical
+    assert [p["event"] for p in sent] == ["budget_warning", "budget_critical"]
+
+
+def test_budget_rearms_next_period(monkeypatch):
+    monkeypatch.setattr(notify, "send_webhook", lambda *a, **k: (True, "200"))
+    a = ThresholdAlerter(None, None, monthly_budget=100.0)
+    assert a.check_budgets(0, 100, "d", "2026-06") == [("monthly", "critical")]
+    assert a.check_budgets(0, 100, "d", "2026-06") == []                    # same month quiet
+    assert a.check_budgets(0, 100, "d", "2026-07") == [("monthly", "critical")]  # new month re-arms
+
+
+def test_no_budget_never_fires():
+    a = ThresholdAlerter(None, None)
+    assert a.check_budgets(999, 999, "d", "m") == []
+
+
+# ── anomaly alerts (deduped per bucket) ──────────────────────────────────────
+def test_notify_anomaly_dedup(monkeypatch):
+    sent = []
+    monkeypatch.setattr(notify, "send_webhook",
+                        lambda u, p, timeout=10: sent.append(p) or (True, "200"))
+    a = ThresholdAlerter(None, "https://hooks.example/x")
+    assert a.notify_anomaly({"bucket_t": 123, "cost": 5.0, "baseline": 1.0}) is True
+    assert a.notify_anomaly({"bucket_t": 123, "cost": 6.0, "baseline": 1.0}) is False  # same bucket
+    assert a.notify_anomaly({"bucket_t": 456, "cost": 7.0, "baseline": 1.0}) is True
+    assert len(sent) == 2 and sent[0]["event"] == "cost_anomaly"

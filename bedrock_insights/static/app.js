@@ -170,10 +170,12 @@ async function loadSettings() {
   try {
     const r = await fetch("/api/settings");
     SETTINGS = await r.json();
-    document.getElementById("set-threshold").value =
-      SETTINGS.threshold === null || SETTINGS.threshold === undefined
-        ? ""
-        : SETTINGS.threshold;
+    const setVal = (id, v) =>
+      (document.getElementById(id).value =
+        v === null || v === undefined ? "" : v);
+    setVal("set-threshold", SETTINGS.threshold);
+    setVal("set-daily-budget", SETTINGS.daily_budget);
+    setVal("set-monthly-budget", SETTINGS.monthly_budget);
     document.getElementById("set-webhook").value = SETTINGS.webhook_url || "";
   } catch (e) {
     /* ignore */
@@ -187,7 +189,10 @@ function setStatus(msg, kind) {
 }
 
 async function saveSettings() {
-  const tv = document.getElementById("set-threshold").value.trim();
+  const val = (id) => {
+    const v = document.getElementById(id).value.trim();
+    return v === "" ? null : v;
+  };
   const wv = document.getElementById("set-webhook").value.trim();
   setStatus("Saving…");
   try {
@@ -195,7 +200,9 @@ async function saveSettings() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        threshold: tv === "" ? null : tv,
+        threshold: val("set-threshold"),
+        daily_budget: val("set-daily-budget"),
+        monthly_budget: val("set-monthly-budget"),
         webhook_url: wv || null,
       }),
     });
@@ -208,6 +215,7 @@ async function saveSettings() {
     SETTINGS = data;
     setStatus("Saved.", "ok");
     toast("Settings saved", "ok");
+    refreshBudgets();
   } catch (e) {
     setStatus("Save failed.", "bad");
     toast("Save failed", "bad");
@@ -374,6 +382,34 @@ function toast(msg, kind) {
     el.classList.remove("show");
     setTimeout(() => el.remove(), 220);
   }, 2600);
+}
+
+// A toast that stays on screen (with a close button) until dismissed, instead
+// of auto-fading — used for things the user might miss otherwise (e.g. an
+// anomaly flagged on a trend bucket that's no longer "latest" by the next
+// poll). Deduped by `key` so repeated polls for the same event don't stack up.
+const _persistentToastKeys = new Set();
+function persistentToast(msg, kind, key) {
+  const box = document.getElementById("toasts");
+  if (!box || (key && _persistentToastKeys.has(key))) return;
+  if (key) _persistentToastKeys.add(key);
+  const el = document.createElement("div");
+  el.className = "toast persistent" + (kind ? " " + kind : "");
+  const text = document.createElement("span");
+  text.textContent = msg;
+  const close = document.createElement("button");
+  close.textContent = "✕";
+  close.setAttribute("aria-label", "Dismiss");
+  close.addEventListener("click", () => {
+    el.classList.remove("show");
+    setTimeout(() => {
+      el.remove();
+      if (key) _persistentToastKeys.delete(key);
+    }, 220);
+  });
+  el.append(text, close);
+  box.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
 }
 
 // ── Inline SVG sparkline for a row ───────────────────────────────────────────
@@ -951,6 +987,99 @@ function renderRegions(list) {
   );
 }
 
+function renderAnomaly(anom) {
+  // Persistent (not auto-fading) and deduped by the bucket's timestamp — the
+  // spike stays flagged even after that bucket is no longer the "latest" one
+  // on the next poll, instead of disappearing before anyone notices it.
+  if (!anom || !anom.cost) return;
+  const key = "anomaly:" + anom.bucket_t;
+  persistentToast(
+    "📈 Cost spike — a time bucket cost " +
+      fmtCost(anom.cost) +
+      " vs ~" +
+      fmtCost(anom.baseline || 0) +
+      " baseline.",
+    "bad",
+    key,
+  );
+}
+
+// ── Budget progress (daily / monthly) ────────────────────────────────────────
+async function refreshBudgets() {
+  try {
+    const r = await fetch("/api/budgets");
+    const data = await r.json();
+    renderBudgets(data);
+  } catch (e) {
+    /* keep last view */
+  }
+}
+
+function _renderBudgetRow(scope, info) {
+  const row = document.getElementById("budget-" + scope);
+  if (!info) {
+    row.style.display = "none";
+    return false;
+  }
+  row.style.display = "";
+  const pct = Math.min(100, Math.round((info.fraction || 0) * 100));
+  const fill = document.getElementById("budget-" + scope + "-fill");
+  fill.style.width = pct + "%";
+  fill.className =
+    "budget-fill" +
+    (info.fraction >= 1 ? " critical" : info.fraction >= 0.8 ? " warning" : "");
+  document.getElementById("budget-" + scope + "-amt").textContent =
+    fmtCost(info.cost) + " / " + fmtCost(info.budget) + " (" + pct + "%)";
+  return true;
+}
+
+function renderBudgets(data) {
+  const hasDaily = _renderBudgetRow("daily", data && data.daily);
+  const hasMonthly = _renderBudgetRow("monthly", data && data.monthly);
+  document.getElementById("panel-budgets").style.display =
+    hasDaily || hasMonthly ? "" : "none";
+}
+
+function renderComparison(cmp) {
+  const el = document.getElementById("c-delta");
+  if (!el) return;
+  if (!cmp || cmp.delta_pct === null || cmp.delta_pct === undefined) {
+    el.textContent = cmp ? "— no prior data" : "";
+    el.className = "delta muted";
+    return;
+  }
+  const d = cmp.delta_pct;
+  const up = d > 0;
+  const arrow = up ? "▲" : d < 0 ? "▼" : "▬";
+  // For spend, an increase is "bad" (red), a decrease is "good" (green).
+  el.textContent =
+    arrow + " " + Math.abs(d).toFixed(1) + "% " + (cmp.label || "");
+  el.className = "delta " + (d > 0 ? "up" : d < 0 ? "down" : "flat");
+  el.title =
+    "Previous window: " +
+    fmtCost(cmp.prev_cost || 0) +
+    " · " +
+    (cmp.prev_calls || 0).toLocaleString() +
+    " calls";
+}
+
+function renderOperations(list) {
+  const cols = [
+    { label: "Operation", left: true, render: (r) => escAttr(r.operation) },
+    { label: "Calls", render: (r) => r.calls.toLocaleString() },
+    {
+      label: "Cost",
+      render: (r) => '<span class="col-cost">' + fmtCost(r.cost) + "</span>",
+    },
+    { label: "Share", render: (r) => fmtPct(r.cost_share || 0) },
+  ];
+  document.getElementById("bd-operation").innerHTML = renderBreakdownTable(
+    list || [],
+    cols,
+    (r) => ({ dim: "operation", val: r.operation, label: r.operation }),
+  );
+}
+
 function renderErrors(errors) {
   const panel = document.getElementById("panel-errors");
   if (!errors || !errors.total) {
@@ -1254,7 +1383,11 @@ async function refresh() {
     renderTable(data);
     renderIdentities(data.identities);
     renderRegions(data.regions);
+    renderOperations(data.operations);
     renderErrors(errors);
+    renderComparison(data.comparison);
+    renderAnomaly(data.anomaly);
+    refreshBudgets();
     if (STATE.tab === "recent") refreshRecent();
 
     const now = new Date();
@@ -1434,5 +1567,6 @@ function toggleTheme() {
     );
 
   await refresh();
+  await refreshBudgets();
   applyRefreshInterval(CONFIG.refresh_seconds);
 })();

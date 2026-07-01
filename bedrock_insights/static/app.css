@@ -176,11 +176,28 @@ canvas {
   color: var(--red);
 }
 
+.grid2 > .panel {
+  /* Grid tracks default to a min-width of "auto" (the content's min-content
+     size), so a wide table inside a panel can force its column — and the
+     whole row — wider than the page instead of being clipped/scrolled. This
+     lets the track actually shrink to the gap; the table's own overflow-x
+     (below) then takes over and scrolls internally instead of overflowing. */
+  min-width: 0;
+}
 .grid2 {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  /* Fixed 2-up grid: each panel's table (region/operation names, counts,
+     cost) needs more room than a 4-column layout gives it at typical
+     widths — 4-up squeezes columns so tight that numbers get clipped.
+     2 per row keeps every panel readable; 1 column on narrow screens. */
+  grid-template-columns: repeat(2, 1fr);
   gap: 14px;
   margin-top: 22px;
+}
+@media (max-width: 640px) {
+  .grid2 {
+    grid-template-columns: 1fr;
+  }
 }
 .mini h3 {
   margin: 0 0 10px;
@@ -687,7 +704,7 @@ footer {
   color: #7a5b00;
 }
 :root[data-theme="light"] .periods button.active,
-:root[data-theme="light"] .setactions button {
+:root[data-theme="light"] .setactions button:not(.secondary) {
   color: #ffffff;
 }
 
@@ -818,6 +835,7 @@ th .arrow {
 #recent,
 #bd-identity,
 #bd-region,
+#bd-operation,
 #bd-errors {
   overflow-x: auto;
 }
@@ -911,4 +929,95 @@ th .arrow {
   font-size: 11px;
   color: var(--muted);
   font-style: italic;
+}
+
+/* ── Period-over-period delta on the cost card ───────────────────────────── */
+.delta {
+  margin-top: 4px;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.delta.up {
+  color: var(--red);
+} /* spend went up → bad */
+.delta.down {
+  color: var(--green);
+} /* spend went down → good */
+.delta.flat {
+  color: var(--muted);
+}
+.delta.muted {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+/* ── Budget progress panel ───────────────────────────────────────────────── */
+.panel.budgets {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+}
+.budget-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.budget-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.budget-amt {
+  color: var(--text);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.budget-track {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--border);
+  overflow: hidden;
+}
+.budget-fill {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+.budget-fill.warning {
+  background: var(--yellow);
+}
+.budget-fill.critical {
+  background: var(--red);
+}
+
+/* ── Persistent toast (stays until dismissed) ────────────────────────────── */
+.toast.persistent {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.toast.persistent span {
+  flex: 1;
+}
+.toast.persistent button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+.toast.persistent button:hover {
+  color: var(--text);
 }

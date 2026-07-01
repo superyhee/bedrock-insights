@@ -42,38 +42,64 @@ class ThresholdAlerter:
     or web monitor that keeps polling won't spam the channel.
     """
 
+    #: fraction of a budget at which a "warning" (vs "critical") alert fires.
+    WARN_FRAC = 0.8
+
     def __init__(
         self,
         threshold: float | None,
         webhook_url: str | None = None,
         *,
+        daily_budget: float | None = None,
+        monthly_budget: float | None = None,
         region: str = "",
         label: str = "",
         console: Console | None = None,
     ) -> None:
         self.threshold = threshold
         self.webhook_url = webhook_url
+        self.daily_budget = daily_budget
+        self.monthly_budget = monthly_budget
         self.region = region
         self.label = label
         self._console = console or _console
-        self._fired = False
+        self._fired = False               # window-threshold one-shot
+        self._budget_fired: dict[str, str] = {}  # "scope:period" -> "warning"|"critical"
+        self._anomaly_key: str | None = None     # dedup key of the last anomaly alerted
         self._lock = threading.Lock()
 
     @property
     def fired(self) -> bool:
         return self._fired
 
-    def configure(self, threshold: float | None, webhook_url: str | None) -> None:
-        """Update threshold/webhook at runtime (from the dashboard). Re-arms on change."""
+    def configure(
+        self,
+        threshold: float | None,
+        webhook_url: str | None,
+        daily_budget: float | None = None,
+        monthly_budget: float | None = None,
+    ) -> None:
+        """Update thresholds/budgets/webhook at runtime (from the dashboard). Re-arms on change."""
         with self._lock:
             if threshold != self.threshold or webhook_url != self.webhook_url:
                 self._fired = False  # re-arm so the new threshold can fire again
+            if (daily_budget != self.daily_budget or monthly_budget != self.monthly_budget
+                    or webhook_url != self.webhook_url):
+                self._budget_fired.clear()  # re-arm budget levels
+                self._anomaly_key = None
             self.threshold = threshold
             self.webhook_url = webhook_url
+            self.daily_budget = daily_budget
+            self.monthly_budget = monthly_budget
 
     def settings(self) -> dict:
         with self._lock:
-            return {"threshold": self.threshold, "webhook_url": self.webhook_url}
+            return {
+                "threshold": self.threshold,
+                "webhook_url": self.webhook_url,
+                "daily_budget": self.daily_budget,
+                "monthly_budget": self.monthly_budget,
+            }
 
     def _build_payload(self, cost: float, threshold: float) -> dict:
         text = (
@@ -104,6 +130,81 @@ class ThresholdAlerter:
             "window": self.label,
         }
         return send_webhook(target, payload)
+
+    def check_budgets(self, daily_cost: float, monthly_cost: float,
+                      day_key: str, month_key: str) -> list[tuple[str, str]]:
+        """Fire daily/monthly budget alerts at warning (≥80%) and critical (≥100%).
+
+        De-duplicates per (scope, period): warning fires at most once per period,
+        critical fires at most once per period (and still fires even if warning
+        already did). Returns the list of (scope, level) alerts fired this call.
+        """
+        fired: list[tuple[str, str]] = []
+        for scope, cost, budget, pkey in (
+            ("daily", daily_cost, self.daily_budget, day_key),
+            ("monthly", monthly_cost, self.monthly_budget, month_key),
+        ):
+            if not budget or budget <= 0:
+                continue
+            frac = cost / budget
+            level = "critical" if frac >= 1.0 else ("warning" if frac >= self.WARN_FRAC else None)
+            if level is None:
+                continue
+            key = f"{scope}:{pkey}"
+            with self._lock:
+                prev = self._budget_fired.get(key)
+                if level == "critical" and prev == "critical":
+                    continue
+                if level == "warning" and prev in ("warning", "critical"):
+                    continue
+                self._budget_fired[key] = level
+                webhook = self.webhook_url
+            icon = "🔴" if level == "critical" else "🟠"
+            self._console.print(
+                f"\n[bold]{icon} {scope.upper()} BUDGET {level.upper()}:[/bold] "
+                f"${cost:.4f} of ${budget:.2f} ({frac * 100:.0f}%)\n"
+            )
+            if webhook:
+                payload = {
+                    "text": (
+                        f"{icon} *Bedrock Insights — {scope} budget {level}*\n"
+                        f"Spend ${cost:.4f} is {frac * 100:.0f}% of the ${budget:.2f} {scope} budget."
+                    ),
+                    "event": f"budget_{level}",
+                    "source": "bedrock-insights",
+                    "scope": scope, "cost": round(cost, 6),
+                    "budget": budget, "fraction": round(frac, 4),
+                }
+                send_webhook(webhook, payload)
+            fired.append((scope, level))
+        return fired
+
+    def notify_anomaly(self, info: dict) -> bool:
+        """Fire a one-off alert for a detected cost spike (deduped per bucket)."""
+        key = str(info.get("bucket_t"))
+        with self._lock:
+            if self._anomaly_key == key:
+                return False
+            self._anomaly_key = key
+            webhook = self.webhook_url
+        cost = info.get("cost", 0.0)
+        baseline = info.get("baseline", 0.0)
+        self._console.print(
+            f"\n[bold yellow]📈 COST ANOMALY:[/bold yellow] a bucket cost "
+            f"${cost:.4f} vs ~${baseline:.4f} baseline\n"
+        )
+        if webhook:
+            payload = {
+                "text": (
+                    "📈 *Bedrock Insights — cost anomaly*\n"
+                    f"A time bucket cost ${cost:.4f}, well above the ~${baseline:.4f} baseline."
+                ),
+                "event": "cost_anomaly",
+                "source": "bedrock-insights",
+                "cost": round(cost, 6), "baseline": round(baseline, 6),
+            }
+            send_webhook(webhook, payload)
+        return True
 
     def check(self, cost: float) -> bool:
         """Alert if cost crosses the threshold for the first time. Returns True if fired."""

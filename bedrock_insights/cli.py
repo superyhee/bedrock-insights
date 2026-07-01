@@ -5,7 +5,7 @@ import click
 from . import __version__
 from .client import make_bedrock_client, make_clients
 from .pricing import set_debug
-from .setup_cmd import run_setup
+from .setup_cmd import auto_setup, run_setup
 from .web import run_web
 
 
@@ -35,6 +35,12 @@ from .web import run_web
               help="Print diagnostic output (e.g. why pricing lookups failed) to stderr.")
 @click.option("--setup", is_flag=True, is_eager=True,
               help="Run one-time setup to enable Bedrock model invocation logging.")
+@click.option("--auto-setup", "auto_setup_flag", is_flag=True,
+              help="Before launching, automatically enable Bedrock model invocation "
+                   "logging (if not already on) in every region about to be monitored. "
+                   "Idempotent, but requires IAM write permissions (iam:CreateRole, "
+                   "logs:CreateLogGroup, bedrock:PutModelInvocationLoggingConfiguration) "
+                   "in each of those regions — off by default, see README.")
 @click.option("--retention", type=int, default=None, metavar="DAYS",
               help="Set log retention in days when running --setup (0 = never expire). Omit to leave existing policy unchanged.")
 def main(
@@ -48,6 +54,7 @@ def main(
     no_content: bool,
     debug: bool,
     setup: bool,
+    auto_setup_flag: bool,
     retention: int | None,
 ) -> None:
     """Monitor AWS Bedrock token usage and costs via a live web dashboard.
@@ -70,6 +77,7 @@ def main(
       bedrock-insights --host 0.0.0.0 --port 9000     # change the bind address
       bedrock-insights --setup                  # one-time setup wizard
       bedrock-insights --setup --retention 90   # setup + 90-day log retention
+      bedrock-insights --auto-setup              # enable logging in every monitored region, then launch
     """
     if debug:
         set_debug(True)
@@ -89,6 +97,9 @@ def main(
             + ".  Pass --region to narrow.",
             err=True,
         )
+
+    if auto_setup_flag:
+        auto_setup([r for r, _ in clients], profile)
 
     run_web(clients, bedrock_client, host, port, token,
             persist=not no_db, show_content=not no_content)

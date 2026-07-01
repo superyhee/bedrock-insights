@@ -34,16 +34,21 @@ class _FakeMonitor:
             "price_known": True, "error": "",
         }][:limit]
 
+    def window_cost(self, start_ms, end_ms):
+        return 4.2
+
 
 class _FakeAlerter:
     def __init__(self):
-        self._s = {"threshold": None, "webhook_url": None}
+        self._s = {"threshold": None, "webhook_url": None,
+                   "daily_budget": None, "monthly_budget": None}
 
     def settings(self):
         return dict(self._s)
 
-    def configure(self, threshold, webhook_url):
-        self._s = {"threshold": threshold, "webhook_url": webhook_url}
+    def configure(self, threshold, webhook_url, daily_budget=None, monthly_budget=None):
+        self._s = {"threshold": threshold, "webhook_url": webhook_url,
+                   "daily_budget": daily_budget, "monthly_budget": monthly_budget}
 
     def send_test(self, url=None):
         return True, "200"
@@ -175,6 +180,40 @@ def test_event_endpoint_disabled_returns_403():
         resp, _ = _req(port, "GET", "/api/event?id=e1&region=us-east-1&t=1",
                        headers={"Authorization": f"Bearer {TOKEN}"})
         assert resp.status == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_budgets_endpoint_empty_when_unset(server):
+    resp, data = _req(server, "GET", f"/api/budgets?token={TOKEN}")
+    assert resp.status == 200
+    import json
+    body = json.loads(data)
+    assert body == {"daily": None, "monthly": None}
+
+
+def test_budgets_endpoint_reports_progress():
+    config = {
+        "refresh_seconds": 5, "region": "us-east-1", "regions": ["us-east-1"],
+        "threshold": None, "periods": [], "default_period": "today",
+        "bind": "127.0.0.1:0", "poll_seconds": 5,
+    }
+    alerter = _FakeAlerter()
+    alerter.configure(None, None, daily_budget=10.0, monthly_budget=100.0)
+    handler = web.build_handler(_FakeMonitor(), alerter, config, TOKEN)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        resp, data = _req(port, "GET", f"/api/budgets?token={TOKEN}")
+        assert resp.status == 200
+        import json
+        body = json.loads(data)
+        assert body["daily"]["budget"] == 10.0
+        assert body["daily"]["cost"] == 4.2
+        assert body["daily"]["fraction"] == pytest.approx(0.42)
+        assert body["monthly"]["budget"] == 100.0
     finally:
         httpd.shutdown()
         httpd.server_close()

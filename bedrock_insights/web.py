@@ -103,6 +103,20 @@ def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
+def _day_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _month_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _month_start_ms() -> int:
+    now = datetime.now(timezone.utc)
+    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return int(first.timestamp() * 1000)
+
+
 def _record_ms(r: dict) -> int:
     """Best-effort event timestamp (ms) for a log record, for time bucketing."""
     ts = r.get("timestamp")
@@ -440,14 +454,16 @@ def _aggregate_facts(
     drill into a single model/identity/region without re-querying CloudWatch.
     """
     bucket_ms = bucket_seconds * 1000
-    f_model    = flt.get("model")    if flt else None
-    f_identity = flt.get("identity") if flt else None
-    f_region   = flt.get("region")   if flt else None
+    f_model     = flt.get("model")     if flt else None
+    f_identity  = flt.get("identity")  if flt else None
+    f_region    = flt.get("region")    if flt else None
+    f_operation = flt.get("operation") if flt else None
 
     usage:   dict[str, dict] = {}
     buckets: dict[int, dict] = {}
     by_identity: dict[str, dict] = {}
     by_region:   dict[str, dict] = {}
+    by_operation: dict[str, dict] = {}
     errors_by_code: dict[str, int] = {}
     error_total = 0
     saved_total = 0.0
@@ -460,6 +476,8 @@ def _aggregate_facts(
         if f_identity is not None and f["ident_key"] != f_identity:
             continue
         if f_region is not None and f["region"] != f_region:
+            continue
+        if f_operation is not None and (f.get("op") or "") != f_operation:
             continue
 
         u = usage.setdefault(f["model"], {
@@ -509,6 +527,15 @@ def _aggregate_facts(
         reg["cost"]   += f["cost"]
         reg["errors"] += 1 if f["err"] else 0
 
+        op = by_operation.setdefault(f.get("op") or "unknown", {
+            "calls": 0, "input": 0, "output": 0, "cost": 0.0, "errors": 0,
+        })
+        op["calls"]  += 1
+        op["input"]  += f["inp"]
+        op["output"] += f["out"]
+        op["cost"]   += f["cost"]
+        op["errors"] += 1 if f["err"] else 0
+
         if f["err"]:
             error_total += 1
             errors_by_code[f["err"]] = errors_by_code.get(f["err"], 0) + 1
@@ -557,6 +584,18 @@ def _aggregate_facts(
         ),
         key=lambda x: x["cost"], reverse=True,
     )
+    payload["operations"] = sorted(
+        (
+            {
+                "operation": name, "calls": d["calls"],
+                "total_tokens": d["input"] + d["output"],
+                "cost": round(d["cost"], 6), "errors": d["errors"],
+                "cost_share": share(d["cost"]),
+            }
+            for name, d in by_operation.items()
+        ),
+        key=lambda x: x["cost"], reverse=True,
+    )
     payload["errors"] = {
         "total": error_total,
         "rate":  round(error_total / total_calls, 4) if total_calls else 0.0,
@@ -566,7 +605,61 @@ def _aggregate_facts(
         ),
     }
     payload["projection"] = compute_projection(total_cost, start_ms, end_ms)
+    payload["anomaly"] = _detect_anomaly(payload["trend"]["points"])
     return payload
+
+
+def _detect_anomaly(points: list[dict]) -> dict | None:
+    """Flag the latest trend bucket if its cost is a clear spike vs. the prior ones.
+
+    Heuristic: cost > mean + 3·stddev of the earlier buckets, and > 1.5× the mean.
+    Returns {bucket_t, cost, baseline} or None. Needs a few buckets of history.
+    """
+    costs = [p["cost"] for p in points]
+    if len(costs) < 6:
+        return None
+    base, last = costs[:-1], costs[-1]
+    n = len(base)
+    mean = sum(base) / n
+    std = (sum((c - mean) ** 2 for c in base) / n) ** 0.5
+    if last > 0 and last > mean + 3 * std and last > mean * 1.5:
+        return {"bucket_t": points[-1]["t"], "cost": round(last, 6), "baseline": round(mean, 6)}
+    return None
+
+
+def _sum_window(facts: list[dict], start_ms: int, end_ms: int, flt: dict | None) -> tuple[float, int]:
+    """Sum (cost, calls) over a window with the same dimension filter as the main view."""
+    f_model     = flt.get("model")     if flt else None
+    f_identity  = flt.get("identity")  if flt else None
+    f_region    = flt.get("region")    if flt else None
+    f_operation = flt.get("operation") if flt else None
+    cost, calls = 0.0, 0
+    for f in facts:
+        if f["t"] < start_ms or f["t"] > end_ms:
+            continue
+        if f_model is not None and f["model"] != f_model:
+            continue
+        if f_identity is not None and f["ident_key"] != f_identity:
+            continue
+        if f_region is not None and f["region"] != f_region:
+            continue
+        if f_operation is not None and (f.get("op") or "") != f_operation:
+            continue
+        cost += f["cost"]
+        calls += 1
+    return cost, calls
+
+
+def _previous_window(period: str, start_ms: int, end_ms: int) -> tuple[int, int, str]:
+    """Return (prev_start, prev_end, label) for the comparable prior window."""
+    day = 86_400_000
+    if period in ("today", "yesterday"):
+        delta, label = day, "vs yesterday" if period == "today" else "vs prior day"
+    elif period == "week":
+        delta, label = 7 * day, "vs prior week"
+    else:  # custom since / absolute drill-in → shift by the window's own span
+        delta, label = (end_ms - start_ms), "vs prior period"
+    return start_ms - delta, end_ms - delta, label
 
 
 def _filter_key(flt: dict | None) -> str:
@@ -730,6 +823,7 @@ class UsageMonitor:
                     "ident_label":  ident_label,
                     "region":       rec_region,
                     "err":          r.get("errorCode") or "",
+                    "op":           r.get("operation") or "",
                     "inp": inp, "out": out, "cw": cw, "cr": cr, "cost": cost,
                     "known": known, "display": display, "saved": saved,
                 }
@@ -819,6 +913,21 @@ class UsageMonitor:
             base["window"] = {
                 "label": label, "start_ms": start_ms, "end_ms": end_ms, "period": period,
             }
+            # Period-over-period comparison: same-length window immediately before.
+            prev_start, prev_end, cmp_label = _previous_window(period, start_ms, end_ms)
+            if self._store is not None and prev_start < self._memory_floor_ms:
+                prev_src, _ = self._store.load(prev_start)
+            else:
+                prev_src = view
+            prev_cost, prev_calls = _sum_window(prev_src, prev_start, prev_end, flt)
+            cur_cost = base["totals"]["cost"]
+            delta_pct = ((cur_cost - prev_cost) / prev_cost * 100) if prev_cost > 0 else None
+            base["comparison"] = {
+                "label":      cmp_label,
+                "prev_cost":  round(prev_cost, 6),
+                "prev_calls": prev_calls,
+                "delta_pct":  round(delta_pct, 1) if delta_pct is not None else None,
+            }
             with self._cache_lock:
                 if version == self._cache_version:  # still fresh — store it
                     self._cache[cache_key] = base
@@ -835,6 +944,23 @@ class UsageMonitor:
         if err is not None:
             payload["warning"] = {"code": err[0], "message": err[1]}
         return payload
+
+    def window_cost(self, start_ms: int, end_ms: int) -> float:
+        """Sum cost over an absolute window without touching the aggregation cache.
+
+        Used for budget checks, which run every poll with a constantly moving
+        `end` (now) — routing that through snapshot()'s cache would produce a
+        fresh, never-reused cache key on every call and force a full
+        re-aggregation each time. This does a direct O(events) sum instead.
+        """
+        with self._lock:
+            view = self._facts[:]
+        if self._store is not None and start_ms < self._memory_floor_ms:
+            src, _ = self._store.load(start_ms)
+        else:
+            src = view
+        cost, _ = _sum_window(src, start_ms, end_ms, None)
+        return cost
 
     def recent(self, limit: int = 20, region: str | None = None) -> list[dict]:
         """Return the most recent retained events (newest first) as display rows."""
@@ -991,13 +1117,32 @@ def build_handler(monitor, alerter, config, token):
                 self._send_json(config)
             elif path == "/api/settings":
                 self._send_json(alerter.settings())
+            elif path == "/api/budgets":
+                settings = alerter.settings()
+                daily_budget = settings.get("daily_budget")
+                monthly_budget = settings.get("monthly_budget")
+                now = _now_ms()
+                body = {"daily": None, "monthly": None}
+                if daily_budget:
+                    daily_cost = monitor.window_cost(get_time_range("today")[0], now)
+                    body["daily"] = {
+                        "budget": daily_budget, "cost": round(daily_cost, 6),
+                        "fraction": round(daily_cost / daily_budget, 4) if daily_budget else 0.0,
+                    }
+                if monthly_budget:
+                    monthly_cost = monitor.window_cost(_month_start_ms(), now)
+                    body["monthly"] = {
+                        "budget": monthly_budget, "cost": round(monthly_cost, 6),
+                        "fraction": round(monthly_cost / monthly_budget, 4) if monthly_budget else 0.0,
+                    }
+                self._send_json(body)
             elif path == "/api/usage":
                 qs = parse_qs(parsed.query)
                 period = qs.get("period", [None])[0]
                 since  = qs.get("since", [None])[0]
                 start, end = _parse_window(qs)
                 flt = {}
-                for dim in ("model", "identity", "region"):
+                for dim in ("model", "identity", "region", "operation"):
                     val = qs.get(dim, [None])[0]
                     if val:
                         flt[dim] = val
@@ -1009,7 +1154,7 @@ def build_handler(monitor, alerter, config, token):
                 since  = qs.get("since", [None])[0]
                 start, end = _parse_window(qs)
                 flt = {}
-                for dim in ("model", "identity", "region"):
+                for dim in ("model", "identity", "region", "operation"):
                     val = qs.get(dim, [None])[0]
                     if val:
                         flt[dim] = val
@@ -1080,20 +1225,33 @@ def build_handler(monitor, alerter, config, token):
             body = self._read_json()
 
             if path == "/api/settings":
-                raw_threshold = body.get("threshold")
-                if raw_threshold in ("", None):
-                    threshold = None
-                else:
+                def _num(field):
+                    """Parse an optional non-negative number field; returns (value, error)."""
+                    raw = body.get(field)
+                    if raw in ("", None):
+                        return None, None
                     try:
-                        threshold = float(raw_threshold)
+                        v = float(raw)
                     except (TypeError, ValueError):
-                        self._send_json({"error": "threshold must be a number"}, status=400)
-                        return
-                    if threshold < 0:
-                        self._send_json({"error": "threshold must be ≥ 0"}, status=400)
-                        return
+                        return None, f"{field} must be a number"
+                    if v < 0:
+                        return None, f"{field} must be ≥ 0"
+                    return v, None
+
+                threshold, err = _num("threshold")
+                if err:
+                    self._send_json({"error": err}, status=400)
+                    return
+                daily_budget, err = _num("daily_budget")
+                if err:
+                    self._send_json({"error": err}, status=400)
+                    return
+                monthly_budget, err = _num("monthly_budget")
+                if err:
+                    self._send_json({"error": err}, status=400)
+                    return
                 webhook_url = body.get("webhook_url") or None
-                alerter.configure(threshold, webhook_url)
+                alerter.configure(threshold, webhook_url, daily_budget, monthly_budget)
                 config["threshold"] = threshold  # keep /api/config in sync
                 self._send_json(alerter.settings())
 
@@ -1147,13 +1305,29 @@ def run_web(
     _, _, label = _resolve_window(period, since)
     alerter = ThresholdAlerter(threshold, webhook, region=region_label, label=label, console=console)
     monitor = UsageMonitor(clients, period, since, store=store, memory_window_days=_MEMORY_WINDOW_DAYS)
-    # Wire the alert check, but skip the (cached) aggregation + payload copy
-    # entirely while no threshold is set or it has already fired — the common
-    # case — so the continuous poll loop stays cheap.
+    # Wire alerting: window threshold, daily/monthly budgets (warning/critical),
+    # and cost-spike anomalies. Skip the work entirely when nothing is configured
+    # so the continuous poll loop stays cheap in the common case.
     def _poll_alert() -> None:
-        if alerter.threshold is None or alerter.fired:
+        if not (alerter.threshold or alerter.daily_budget
+                or alerter.monthly_budget or alerter.webhook_url):
             return
-        alerter.check(monitor.snapshot()["totals"]["cost"])
+        snap = monitor.snapshot()
+        # Budget/threshold/anomaly checks can each POST a webhook; run them off
+        # the polling thread so a slow/unresponsive endpoint (up to the 10s
+        # send_webhook timeout, ×4 possible alerts) never stalls CloudWatch polling.
+        threading.Thread(target=_run_alert_checks, args=(snap,), daemon=True).start()
+
+    def _run_alert_checks(snap: dict) -> None:
+        alerter.check(snap["totals"]["cost"])
+        if alerter.daily_budget or alerter.monthly_budget:
+            now = _now_ms()
+            # Direct window sums (bypass the aggregation cache — see window_cost).
+            daily = monitor.window_cost(get_time_range("today")[0], now)
+            monthly = monitor.window_cost(_month_start_ms(), now)
+            alerter.check_budgets(daily, monthly, _day_key(), _month_key())
+        if snap.get("anomaly") and alerter.webhook_url:
+            alerter.notify_anomaly(snap["anomaly"])
 
     monitor._poll_callback = _poll_alert
     if store is not None:

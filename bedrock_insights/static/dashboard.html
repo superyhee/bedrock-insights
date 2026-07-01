@@ -74,8 +74,19 @@
 
         <h3 style="margin-top:18px">Alerts</h3>
         <div class="setrow">
-          <label for="set-threshold">Threshold ($) <span class="muted">— leave blank to disable</span></label>
+          <label for="set-threshold">Window threshold ($) <span class="muted">— alert once when the current view's spend
+              crosses this</span></label>
           <input id="set-threshold" type="number" step="0.01" min="0" placeholder="disabled">
+        </div>
+        <div class="setrow">
+          <label for="set-daily-budget">Daily budget ($) <span class="muted">— warns at 80%, critical at 100% (per
+              day)</span></label>
+          <input id="set-daily-budget" type="number" step="0.01" min="0" placeholder="disabled">
+        </div>
+        <div class="setrow">
+          <label for="set-monthly-budget">Monthly budget ($) <span class="muted">— warns at 80%, critical at 100% (per
+              month)</span></label>
+          <input id="set-monthly-budget" type="number" step="0.01" min="0" placeholder="disabled">
         </div>
         <div class="setrow">
           <label for="set-webhook">Webhook URL <span class="muted">(Slack incoming webhook or any JSON
@@ -119,6 +130,7 @@
       <div class="card cost">
         <div class="k">Estimated Cost</div>
         <div class="v skeleton" id="c-cost"></div>
+        <div class="delta" id="c-delta"></div>
       </div>
       <div class="card calls">
         <div class="k">Total Calls</div>
@@ -155,6 +167,17 @@
       </div>
     </div>
 
+    <div class="panel budgets" id="panel-budgets" style="display:none">
+      <div class="budget-row" id="budget-daily" style="display:none">
+        <div class="budget-label">Daily budget<span class="budget-amt" id="budget-daily-amt"></span></div>
+        <div class="budget-track"><span class="budget-fill" id="budget-daily-fill"></span></div>
+      </div>
+      <div class="budget-row" id="budget-monthly" style="display:none">
+        <div class="budget-label">Monthly budget<span class="budget-amt" id="budget-monthly-amt"></span></div>
+        <div class="budget-track"><span class="budget-fill" id="budget-monthly-fill"></span></div>
+      </div>
+    </div>
+
     <div class="tabs" id="tabs" role="tablist" aria-label="Views">
       <button class="tab active" id="tab-overview" data-tab="overview" role="tab" aria-selected="true"
         aria-controls="view-overview">Overview</button>
@@ -179,6 +202,10 @@
         <div class="panel mini">
           <h3>By Region</h3>
           <div id="bd-region"></div>
+        </div>
+        <div class="panel mini">
+          <h3>By Operation</h3>
+          <div id="bd-operation"></div>
         </div>
         <div class="panel mini" id="panel-errors" style="display:none">
           <h3>Errors</h3>

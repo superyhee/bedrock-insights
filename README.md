@@ -37,7 +37,7 @@ Bedrock doesn't log invocations by default. Run the setup wizard once per AWS ac
 bedrock-insights --setup
 ```
 
-This creates the CloudWatch log group, an IAM role for Bedrock to write to it, and enables model invocation logging. Takes about 10 seconds. After that, every Bedrock call shows up within ~30 seconds. To enable logging in several regions at once, pass `--region us-east-1,us-west-2`.
+This creates the CloudWatch log group, an IAM role for Bedrock to write to it, and enables model invocation logging. Takes about 10 seconds. After that, every Bedrock call shows up within ~30 seconds. With no `--region`, it sets up the same major Bedrock regions the dashboard monitors by default; pass `--region us-east-1,us-west-2` to target specific ones instead.
 
 Control log retention with `--retention`:
 
@@ -47,6 +47,17 @@ bedrock-insights --setup --retention 0    # remove any existing retention policy
 ```
 
 If you don't have IAM permissions to create roles, the wizard prints the exact policies and CLI command to hand off to your admin.
+
+### Auto-setup on launch
+
+`--auto-setup` folds the wizard into a normal launch: before starting the dashboard, it checks each region about to be monitored and enables Bedrock invocation logging in any that don't already have it (skipping regions that are already configured, so it's safe to leave on for every launch).
+
+```bash
+bedrock-insights --auto-setup                                       # major regions
+bedrock-insights --auto-setup --region us-east-1,ap-southeast-1     # specific regions
+```
+
+It's **off by default** — a plain launch stays read-only. Turning it on means the process needs write permissions in every monitored region (`iam:CreateRole`, `iam:PutRolePolicy`, `logs:CreateLogGroup`, `logs:PutRetentionPolicy`, `bedrock:PutModelInvocationLoggingConfiguration` — the same ones `--setup` needs; see [Requirements](#requirements)). A failure in one region is reported and skipped rather than blocking the others or the dashboard from starting.
 
 ## Usage
 
@@ -62,17 +73,18 @@ Open the printed URL (default `http://127.0.0.1:8765`) in your browser. The comm
 
 ### Options
 
-| Option                         | Purpose                                                                                       |
-| ------------------------------ | --------------------------------------------------------------------------------------------- |
-| `--region us-east-1,us-west-2` | Region(s) to monitor (default: the major Bedrock regions)                                     |
-| `--host` / `--port`            | Bind address (default `127.0.0.1:8765`)                                                       |
-| `--token TOKEN`                | Require a token on every route (also `BEDROCK_INSIGHTS_TOKEN`)                                |
-| `--no-db`                      | Disable on-disk persistence (in-memory only)                                                  |
-| `--no-content`                 | Disable viewing prompt/response bodies in the Recent tab (also `BEDROCK_INSIGHTS_NO_CONTENT`) |
-| `--profile`                    | AWS named profile                                                                             |
-| `--debug`                      | Print diagnostics (e.g. why a price lookup failed) to stderr                                  |
-| `--setup` / `--retention DAYS` | One-time logging setup / log retention                                                        |
-| `--version`                    | Print version                                                                                 |
+| Option                         | Purpose                                                                                                                                                     |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--region us-east-1,us-west-2` | Region(s) to monitor (default: the major Bedrock regions)                                                                                                   |
+| `--host` / `--port`            | Bind address (default `127.0.0.1:8765`)                                                                                                                     |
+| `--token TOKEN`                | Require a token on every route (also `BEDROCK_INSIGHTS_TOKEN`)                                                                                              |
+| `--no-db`                      | Disable on-disk persistence (in-memory only)                                                                                                                |
+| `--no-content`                 | Disable viewing prompt/response bodies in the Recent tab (also `BEDROCK_INSIGHTS_NO_CONTENT`)                                                               |
+| `--profile`                    | AWS named profile                                                                                                                                           |
+| `--debug`                      | Print diagnostics (e.g. why a price lookup failed) to stderr                                                                                                |
+| `--setup` / `--retention DAYS` | One-time logging setup / log retention                                                                                                                      |
+| `--auto-setup`                 | Auto-enable Bedrock invocation logging in every monitored region before launching (needs IAM write permissions — see [First-time setup](#first-time-setup)) |
+| `--version`                    | Print version                                                                                                                                               |
 
 ## The dashboard
 
@@ -197,11 +209,17 @@ For a model not yet in either source, the dashboard shows `N/A` for cost; you ca
 ## Requirements
 
 - Python 3.9+
-- AWS credentials with:
+- AWS credentials with (read-only — this is all a plain launch needs):
   - `logs:FilterLogEvents` on `/aws/bedrock/model-invocations`
   - `bedrock:ListFoundationModels` and `bedrock:ListInferenceProfiles` for live model discovery
   - `pricing:ListPriceLists` and `pricing:GetPriceListFileUrl` for live pricing
 - Bedrock model invocation logging enabled (run `--setup` if not)
+
+**Only needed for `--setup` / `--auto-setup`** (never required for normal launches):
+
+- `logs:CreateLogGroup` and `logs:PutRetentionPolicy`
+- `iam:CreateRole`, `iam:GetRole`, and `iam:PutRolePolicy`
+- `bedrock:GetModelInvocationLoggingConfiguration` and `bedrock:PutModelInvocationLoggingConfiguration`
 
 ## Development
 

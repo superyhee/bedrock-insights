@@ -735,3 +735,92 @@ def test_recent_row_includes_event_id():
             "err": "", "inp": 1, "out": 1, "cw": 0, "cr": 0, "cost": 0.0, "known": True,
             "key": "us-east-1:evt-123"}
     assert web._recent_row(fact)["event_id"] == "evt-123"
+
+
+# ── operation dimension ──────────────────────────────────────────────────────
+def _rec_op(eid, op, inp=100):
+    r = _rec(eid, inp=inp)
+    r["operation"] = op
+    return r
+
+
+def test_operation_breakdown(fixed_pricing, monkeypatch):
+    recs = [_rec_op("1", "Converse"), _rec_op("2", "InvokeModel"), _rec_op("3", "Converse")]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    ops = {o["operation"]: o for o in m.snapshot(since="3h")["operations"]}
+    assert ops["Converse"]["calls"] == 2
+    assert ops["InvokeModel"]["calls"] == 1
+
+
+def test_filter_by_operation(fixed_pricing, monkeypatch):
+    recs = [_rec_op("1", "Converse"), _rec_op("2", "InvokeModel"), _rec_op("3", "Converse")]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    assert m.snapshot(None, {"operation": "Converse"}, "3h")["totals"]["calls"] == 2
+
+
+# ── period-over-period comparison ────────────────────────────────────────────
+def test_period_comparison_delta(fixed_pricing, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.isoformat()  # noqa: E731
+    recs = [
+        _rec("cur", inp=1000, ts=iso(now - timedelta(minutes=30))),   # current 3h window
+        _rec("prev", inp=1000, ts=iso(now - timedelta(hours=4))),     # previous 3h window
+    ]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    cmp = m.snapshot(since="3h")["comparison"]
+    assert cmp["prev_calls"] == 1
+    assert cmp["delta_pct"] == 0.0  # equal cost → 0% change
+
+
+def test_period_comparison_no_prior_data(fixed_pricing, monkeypatch):
+    m = _monitor(monkeypatch, [_rec("only", inp=100)])
+    m.prime()
+    cmp = m.snapshot(since="1h")["comparison"]
+    assert cmp["prev_cost"] == 0.0 and cmp["delta_pct"] is None
+
+
+# ── anomaly detection ────────────────────────────────────────────────────────
+def test_detect_anomaly_flags_spike():
+    pts = [{"t": i, "cost": 1.0} for i in range(8)] + [{"t": 8, "cost": 50.0}]
+    a = web._detect_anomaly(pts)
+    assert a is not None and a["bucket_t"] == 8 and a["cost"] == 50.0
+
+
+def test_detect_anomaly_none_when_flat():
+    pts = [{"t": i, "cost": 1.0} for i in range(9)]
+    assert web._detect_anomaly(pts) is None
+
+
+def test_detect_anomaly_needs_history():
+    assert web._detect_anomaly([{"t": 0, "cost": 9.0}]) is None
+
+
+# ── window_cost (bypasses the aggregation cache; used for budget checks) ─────
+def test_window_cost_sums_without_caching(fixed_pricing, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    iso = lambda d: d.isoformat()  # noqa: E731
+    recs = [
+        _rec("a", inp=1000, ts=iso(now - timedelta(minutes=10))),
+        _rec("b", inp=1000, ts=iso(now - timedelta(minutes=1))),
+    ]
+    m = _monitor(monkeypatch, recs)
+    m.prime()
+    start = int((now - timedelta(hours=1)).timestamp() * 1000)
+    end = int(now.timestamp() * 1000)
+    cost = m.window_cost(start, end)
+    assert cost > 0
+    # Calling repeatedly with a slightly different `end` (simulating a moving
+    # "now") must not error and must not require the value to be cached.
+    cost2 = m.window_cost(start, end + 1000)
+    assert cost2 >= cost
+
+
+def test_window_cost_zero_when_no_facts(fixed_pricing, monkeypatch):
+    m = _monitor(monkeypatch, [])
+    m.prime()
+    assert m.window_cost(0, web._now_ms()) == 0.0

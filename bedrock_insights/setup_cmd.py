@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.exceptions import ClientError, NoRegionError
@@ -43,16 +45,69 @@ _PERMISSION_POLICY = {
 
 
 def run_setup(region: str | None, profile: str | None, retention: int | None = None) -> None:
-    """Run setup for one or more (comma-separated) regions."""
-    from .client import parse_regions
-    regions = parse_regions(region) or [None]
+    """Run setup for one or more (comma-separated) regions.
+
+    With no --region, defaults to the same major Bedrock regions the
+    dashboard monitors by default (rather than just the current session's
+    region), so a plain `--setup` covers what a plain launch will look at.
+    """
+    from .client import MAJOR_REGIONS, parse_regions
+    regions = parse_regions(region) or list(MAJOR_REGIONS)
     for i, r in enumerate(regions):
         if len(regions) > 1:
             console.print(f"\n[bold]══ Region {i + 1}/{len(regions)}: {r} ══[/bold]")
         _run_setup_region(r, profile, retention)
 
 
-def _run_setup_region(region: str | None, profile: str | None, retention: int | None = None) -> None:
+def _auto_setup_one(region: str, profile: str | None) -> str:
+    """Run setup for one region into a private buffer; return the rendered output.
+
+    Runs off the main thread (see auto_setup), so it must not touch the shared
+    module-level `console` — each call gets its own Console writing to an
+    in-memory buffer, which the caller prints once the region is done. This
+    keeps concurrent regions' output from interleaving on the terminal.
+    """
+    buf = io.StringIO()
+    region_console = Console(file=buf, force_terminal=True, width=100)
+    try:
+        _run_setup_region(region, profile, retention=None, out=region_console)
+    except Exception as exc:  # noqa: BLE001 — never let one region's crash break the batch
+        region_console.print(f"[yellow]--auto-setup: skipped {region} after an unexpected error:[/yellow] {exc!r}")
+    return buf.getvalue()
+
+
+def auto_setup(regions: list[str], profile: str | None) -> None:
+    """Best-effort, quiet setup for each region the dashboard is about to monitor.
+
+    Used by `--auto-setup`: enables Bedrock invocation logging in any region
+    that doesn't already have it configured. Idempotent (skips regions that
+    are already set up) and non-fatal — a failure in one region (e.g. missing
+    IAM permissions) is reported and skipped rather than aborting startup.
+
+    Regions run concurrently (new-role creation has a ~7s IAM-propagation wait,
+    so running N regions sequentially could otherwise add tens of seconds to
+    every launch); each region's output is buffered and flushed in order so
+    concurrent regions don't interleave on the terminal.
+    """
+    if not regions:
+        return
+    console.print(
+        f"[dim]--auto-setup: checking Bedrock invocation logging in "
+        f"{len(regions)} region(s) (in parallel)…[/dim]"
+    )
+    with ThreadPoolExecutor(max_workers=min(8, len(regions))) as pool:
+        # Submit in order but read results in submission order (not completion
+        # order) so output stays deterministic run to run.
+        futures = [pool.submit(_auto_setup_one, r, profile) for r in regions]
+        for r, fut in zip(regions, futures):
+            console.print(f"\n[bold]── {r} ──[/bold]")
+            console.file.write(fut.result())
+            console.file.flush()
+
+
+def _run_setup_region(region: str | None, profile: str | None, retention: int | None = None,
+                      out: Console | None = None) -> None:
+    console = out or globals()["console"]
     session = boto3.Session(profile_name=profile, region_name=region)
     resolved_region = session.region_name
     try:
@@ -99,7 +154,7 @@ def _run_setup_region(region: str | None, profile: str | None, retention: int | 
                 f"  Log group : [cyan]{cw['logGroupName']}[/cyan]\n"
                 f"  Role ARN  : [cyan]{cw.get('roleArn', 'n/a')}[/cyan]"
             )
-            _apply_retention(logs, retention)
+            _apply_retention(logs, retention, console)
             return
     except ClientError as exc:
         console.print(
@@ -119,7 +174,7 @@ def _run_setup_region(region: str | None, profile: str | None, retention: int | 
             console.print(f"[red]failed[/red] — {exc.response['Error']['Message']}")
             return
 
-    _apply_retention(logs, retention)
+    _apply_retention(logs, retention, console)
 
     # ── 3. Create / verify IAM role ──────────────────────────────────────────
     role_arn: str | None = None
@@ -138,7 +193,7 @@ def _run_setup_region(region: str | None, profile: str | None, retention: int | 
             console.print("[dim]already exists[/dim]")
         else:
             console.print(f"[red]failed[/red] — {exc.response['Error']['Message']}")
-            _print_manual_steps(account_id, actual_region)
+            _print_manual_steps(account_id, actual_region, console)
             return
 
     # Attach inline permission policy
@@ -184,7 +239,7 @@ def _run_setup_region(region: str | None, profile: str | None, retention: int | 
     )
 
 
-def _apply_retention(logs, retention: int | None) -> None:
+def _apply_retention(logs, retention: int | None, console: Console) -> None:
     if retention is None:
         console.print(
             "  [dim]Tip: re-run with [bold]--retention DAYS[/bold] to set a retention policy, "
@@ -207,7 +262,7 @@ def _apply_retention(logs, retention: int | None) -> None:
             console.print(f"  [yellow]Warning: could not set retention policy:[/yellow] {exc.response['Error']['Message']}")
 
 
-def _print_manual_steps(account_id: str, region: str) -> None:
+def _print_manual_steps(account_id: str, region: str, console: Console) -> None:
     console.print(
         "\n[yellow]Insufficient permissions to create the IAM role automatically.[/yellow]\n"
         "Ask your admin to create a role named [bold]AmazonBedrockModelInvocationLoggingRole[/bold] with:\n"
