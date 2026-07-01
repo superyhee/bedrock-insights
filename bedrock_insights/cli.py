@@ -28,6 +28,9 @@ from .web import run_web
                    "Recommended when binding to a non-localhost --host.")
 @click.option("--no-db", "no_db", is_flag=True,
               help="Disable on-disk persistence (run in-memory only; history is lost on restart).")
+@click.option("--no-content", "no_content", is_flag=True, envvar="BEDROCK_INSIGHTS_NO_CONTENT",
+              help="Disable viewing prompt/response bodies in the Recent tab "
+                   "(recommended for shared/network-exposed deployments).")
 @click.option("--debug", is_flag=True,
               help="Print diagnostic output (e.g. why pricing lookups failed) to stderr.")
 @click.option("--setup", is_flag=True, is_eager=True,
@@ -42,6 +45,7 @@ def main(
     profile: str | None,
     token: str | None,
     no_db: bool,
+    no_content: bool,
     debug: bool,
     setup: bool,
     retention: int | None,
@@ -86,4 +90,5 @@ def main(
             err=True,
         )
 
-    run_web(clients, bedrock_client, host, port, token, persist=not no_db)
+    run_web(clients, bedrock_client, host, port, token,
+            persist=not no_db, show_content=not no_content)

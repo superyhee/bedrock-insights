@@ -1041,7 +1041,7 @@ function renderRecent(events) {
     const status = e.error
       ? '<span class="err-code">' + escAttr(e.error) + "</span>"
       : '<span style="color:#3fb950">✓</span>';
-    const expandable = !!e.event_id;
+    const expandable = CONFIG.content_enabled !== false && !!e.event_id;
     const rowAttrs = expandable
       ? ' class="rec-row" tabindex="0" data-eid="' +
         escAttr(e.event_id) +

@@ -845,11 +845,13 @@ class UsageMonitor:
         return [_recent_row(f) for f in rows]
 
     def fetch_event(self, region: str | None, event_id: str, t_ms: int,
-                    pad_ms: int = 120_000) -> dict:
+                    pad_ms: int = 30_000, max_scan: int = 5_000) -> dict:
         """Re-read a single invocation's full record from CloudWatch on demand.
 
-        Used to show the request/response bodies for one event. The content is
-        fetched live and never persisted — it stays only in CloudWatch.
+        Used to show the request/response bodies for one event. Content is
+        fetched live and never persisted — it stays only in CloudWatch. The scan
+        is bounded (narrow time window + a page/scan cap) to keep the cost of
+        FilterLogEvents predictable under high log volume.
         """
         if not event_id:
             return {"error": "missing event id"}
@@ -857,12 +859,16 @@ class UsageMonitor:
         targets = [(region, by_region[region])] if region in by_region else self._clients
         for _reg, client in targets:
             try:
+                scanned = 0
                 for r in iter_log_events(client, t_ms - pad_ms, t_ms + pad_ms):
                     if r.get("_eventId") == event_id:
                         return _event_detail(r)
+                    scanned += 1
+                    if scanned >= max_scan:
+                        break
             except ClientError as exc:
                 return {"error": exc.response["Error"]["Code"]}
-        return {"error": "not found (it may have aged out of the log window)"}
+        return {"error": "not found (aged out, or too many events in the window)"}
 
 
 def _parse_window(qs: dict) -> tuple[int | None, int | None]:
@@ -963,6 +969,12 @@ def build_handler(monitor, alerter, config, token):
             parsed = urlparse(self.path)
             path = parsed.path
 
+            # Unauthenticated liveness probe (no sensitive data) for load
+            # balancers / uptime monitors.
+            if path == "/healthz":
+                self._send_json({"status": "ok"})
+                return
+
             if not self._authorized():
                 if path == "/":
                     self._send_html(_AUTH_REQUIRED_HTML, status=401)
@@ -1025,6 +1037,12 @@ def build_handler(monitor, alerter, config, token):
                 region = qs.get("region", [None])[0]
                 self._send_json({"events": monitor.recent(limit, region)})
             elif path == "/api/event":
+                if not config.get("content_enabled", True):
+                    self._send_json(
+                        {"error": "prompt/response viewing is disabled on this server"},
+                        status=403,
+                    )
+                    return
                 qs = parse_qs(parsed.query)
                 event_id = qs.get("id", [None])[0]
                 region = qs.get("region", [None])[0]
@@ -1096,6 +1114,7 @@ def run_web(
     port: int,
     token: str | None = None,
     persist: bool = True,
+    show_content: bool = True,
 ) -> None:
     """Start the dashboard HTTP server and block until interrupted.
 
@@ -1153,6 +1172,7 @@ def run_web(
         "default_period":  monitor._default_period,
         "bind":            f"{host}:{port}",
         "poll_seconds":    REFRESH_SECONDS,
+        "content_enabled": show_content,
     }
 
     Handler = build_handler(monitor, alerter, config, token)

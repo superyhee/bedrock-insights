@@ -62,27 +62,33 @@ Open the printed URL (default `http://127.0.0.1:8765`) in your browser. The comm
 
 ### Options
 
-| Option                         | Purpose                                                        |
-| ------------------------------ | -------------------------------------------------------------- |
-| `--region us-east-1,us-west-2` | Region(s) to monitor (default: the major Bedrock regions)      |
-| `--host` / `--port`            | Bind address (default `127.0.0.1:8765`)                        |
-| `--token TOKEN`                | Require a token on every route (also `BEDROCK_INSIGHTS_TOKEN`) |
-| `--no-db`                      | Disable on-disk persistence (in-memory only)                   |
-| `--profile`                    | AWS named profile                                              |
-| `--debug`                      | Print diagnostics (e.g. why a price lookup failed) to stderr   |
-| `--setup` / `--retention DAYS` | One-time logging setup / log retention                         |
-| `--version`                    | Print version                                                  |
+| Option                         | Purpose                                                                                       |
+| ------------------------------ | --------------------------------------------------------------------------------------------- |
+| `--region us-east-1,us-west-2` | Region(s) to monitor (default: the major Bedrock regions)                                     |
+| `--host` / `--port`            | Bind address (default `127.0.0.1:8765`)                                                       |
+| `--token TOKEN`                | Require a token on every route (also `BEDROCK_INSIGHTS_TOKEN`)                                |
+| `--no-db`                      | Disable on-disk persistence (in-memory only)                                                  |
+| `--no-content`                 | Disable viewing prompt/response bodies in the Recent tab (also `BEDROCK_INSIGHTS_NO_CONTENT`) |
+| `--profile`                    | AWS named profile                                                                             |
+| `--debug`                      | Print diagnostics (e.g. why a price lookup failed) to stderr                                  |
+| `--setup` / `--retention DAYS` | One-time logging setup / log retention                                                        |
+| `--version`                    | Print version                                                                                 |
 
 ## The dashboard
 
-A dependency-free web UI (Python stdlib server, no front-end build, no CDN) that auto-refreshes:
+A dependency-free web UI (Python stdlib server, no front-end build, no CDN) that auto-refreshes and adapts to light/dark themes:
 
-- **Summary cards** — estimated cost, calls, total tokens, average $/call, burn rate, projected $/day, error rate, cache hit rate.
-- **Cost-over-time chart** — hover any bucket for exact figures.
-- **Breakdowns** — by model, by IAM identity, by region, by error code.
-- **Interactive** — switch the time window and region, click any row to filter the whole dashboard, and use the **Export JSON / Export CSV** buttons to download the current view.
-- **⚙ Settings** — set a custom rolling window, spend threshold, Slack/webhook alert, and refresh interval at runtime.
+- **Summary cards** — estimated cost, calls, total tokens, average $/call, burn rate, projected $/day, error rate, cache hit rate, and estimated **cache savings** (what prompt-cache reads saved versus full input price). Values count up as they update.
+- **Cost-over-time chart** — rounded axis ticks; hover any bucket for exact figures; **click a bucket to drill the whole dashboard into that time range**.
+- **Two tabs** — _Overview_ (chart + tables) and _Recent_.
+- **Breakdowns** — by model (sortable columns, per-row sparkline), by IAM identity, by region, by error code.
+- **Stacked filtering** — click any row to filter; model + IAM identity + region filters apply together and show as removable breadcrumb chips.
+- **Recent tab** — the latest invocations; **expand a row to view its request/response bodies**, fetched live from CloudWatch and never stored by the dashboard (disable entirely with `--no-content`).
+- **⚙ Settings** (slide-over) — custom rolling window, spend threshold, Slack/webhook alert, and refresh interval at runtime.
+- **Share / export** — copy a link that restores the current view (period, region, filters, tab), and download the current view as **JSON / CSV**.
+- **Keyboard** — `g` settings · `Esc` close · `r` refresh · `1`/`2` switch tab · `[`/`]` cycle time window.
 - **`GET /metrics`** — Prometheus exposition format, ready to scrape into Grafana.
+- **`GET /healthz`** — unauthenticated liveness probe (`{"status":"ok"}`) for load balancers / uptime monitors.
 
 ## Sharing the dashboard (authentication)
 
@@ -92,7 +98,7 @@ By default the dashboard binds to `127.0.0.1` (localhost) with no authentication
 bedrock-insights --host 0.0.0.0 --token "$(openssl rand -hex 16)"
 ```
 
-Every route then requires the token, accepted three ways:
+Every route (except the unauthenticated `/healthz` probe) then requires the token, accepted three ways:
 
 - **Browser** — open the URL printed at startup (it includes `?token=…`); the server sets an `HttpOnly` cookie and the token is stripped from the address bar.
 - **Scrapers** (`/metrics`) — send `Authorization: Bearer <token>` (Prometheus `bearer_token`) or `?token=<token>`.
@@ -142,6 +148,26 @@ Open `https://<dashboard-url>/?token=<your-token>` once — the page stores the 
 
 > **Notes.** The instance installs from this GitHub repo, so the repository must be **public** (or the `git+https://…` URL in the template's user data needs credentials). Logging is enabled only in the stack's region — deploy a stack per region to monitor others, or run `--setup` there. The token is embedded in EC2 user data and is recoverable via `ec2:DescribeInstanceAttribute`; rotate it if your trusted-operator set changes. Validate the template first with `aws cloudformation validate-template --template-body file://deploy/cloudformation.yaml`. Tear everything down with `aws cloudformation delete-stack --stack-name bedrock-insights` (the log group is retained on purpose so history isn't lost).
 
+### Cost
+
+The hosted stack is deliberately lean — there's **no NAT Gateway** (the instance sits in a public subnet behind the CloudFront prefix list). Rough monthly estimate for a 24/7 deployment in `us-west-2` with defaults:
+
+| Item                                                     | Estimate / month        |
+| -------------------------------------------------------- | ----------------------- |
+| EC2 `t3.small` on-demand                                 | ~$15                    |
+| Public IPv4 address (1)                                  | ~$3.7                   |
+| EBS gp3 root volume (8 GB)                               | ~$0.6                   |
+| CloudFront (PriceClass_100, light)                       | < $1                    |
+| Lambda custom resources, SSM, Pricing/Bedrock list calls | ~$0 (one-off at deploy) |
+
+**Baseline ≈ $20/month**, plus CloudWatch Logs charges that scale with your Bedrock invocation volume (ingestion ~$0.50/GB + storage ~$0.03/GB-month). Those log costs exist whenever Bedrock invocation logging is on — they aren't specific to this dashboard.
+
+The dashboard's polling and the Recent-tab detail lookups use `logs:FilterLogEvents`, which is **not billed per call** (CloudWatch Logs bills ingestion, storage, and Insights queries) — so how often the dashboard polls or how many tabs are open doesn't change the bill (the practical limit is API throttling, not cost).
+
+**To spend less:** deploy with `--parameter-overrides InstanceType=t3.micro` (~$7.6/month) for light monitoring, lower `LogRetentionDays`, apply an EC2 Savings Plan for long-running stacks, or skip the hosted stack entirely and run `bedrock-insights` locally (no EC2 / IP / CloudFront cost — just your existing CloudWatch log charges).
+
+> Prices are approximate and change over time; check the [AWS pricing pages](https://aws.amazon.com/pricing/) for current rates. Content was rephrased for compliance with licensing restrictions.
+
 ## Persistence
 
 Per-event data is stored in SQLite at `~/.config/bedrock-insights/facts.db`, so:
@@ -155,7 +181,9 @@ Storage is hybrid: recent events (the last ~8 days, covering today/yesterday/wee
 
 Bedrock writes a JSON record to `/aws/bedrock/model-invocations` in CloudWatch for every model call (model ID, input/output and cache token counts, caller identity, region). `bedrock-insights` reads those records, normalizes model IDs, applies per-region pricing, and serves the dashboard.
 
-A background poller queries each region (concurrently) every 5 seconds with a 90-second overlap window — to absorb CloudWatch's ingestion delay — and deduplicates events by ID. It keeps a slim per-event "fact" so the UI can aggregate any window/region/filter on demand, and caches aggregations so the load on CloudWatch stays constant regardless of how many browser tabs or scrapers are connected.
+A background poller queries each region (concurrently) on an interval (5 s by default; set `BEDROCK_INSIGHTS_POLL_SECONDS`, or `PollSeconds` in the CloudFormation deploy) with a 90-second overlap window — to absorb CloudWatch's ingestion delay — and deduplicates events by ID. It keeps a slim per-event "fact" (token counts and cost — never prompt/response text) so the UI can aggregate any window/region/filter on demand, and caches aggregations so the load on CloudWatch stays constant regardless of how many browser tabs or scrapers are connected.
+
+Prompt/response bodies are **not** part of that fact and are never stored: the Recent tab fetches a single event's bodies live from CloudWatch only when you expand it (a bounded lookup — a narrow time window with a scan cap), and `--no-content` turns that off server-side.
 
 ## Pricing
 

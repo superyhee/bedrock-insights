@@ -152,3 +152,29 @@ def test_oversized_body_is_ignored(server):
     import json
     assert resp.status == 200
     assert json.loads(data)["threshold"] is None  # body ignored → cleared
+
+
+def test_healthz_is_unauthenticated(server):
+    resp, data = _req(server, "GET", "/healthz")  # no token
+    assert resp.status == 200
+    import json
+    assert json.loads(data)["status"] == "ok"
+
+
+def test_event_endpoint_disabled_returns_403():
+    config = {
+        "refresh_seconds": 5, "region": "us-east-1", "regions": ["us-east-1"],
+        "threshold": None, "periods": [], "default_period": "today",
+        "bind": "127.0.0.1:0", "poll_seconds": 5, "content_enabled": False,
+    }
+    handler = web.build_handler(_FakeMonitor(), _FakeAlerter(), config, TOKEN)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        resp, _ = _req(port, "GET", "/api/event?id=e1&region=us-east-1&t=1",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+        assert resp.status == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
